@@ -1,0 +1,34 @@
+{
+  "name": "app-data-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for discovering and querying internal data assets from local metadata first.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/server.ts",
+    "dev:http": "tsx src/http.ts",
+    "init:assets": "tsx src/initAssets.ts",
+    "init:assets:force": "tsx src/initAssets.ts --force",
+    "sync:metabase": "tsx src/sync/metabase.ts",
+    "sync:posthog": "tsx src/sync/posthog.ts",
+    "sync:all": "npm run sync:metabase && npm run sync:posthog",
+    "start": "node dist/server.js",
+    "start:http": "node dist/http.js",
+    "check": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.16.0",
+    "@types/pg": "^8.20.0",
+    "dotenv": "^17.2.3",
+    "express": "^5.2.1",
+    "pg": "^8.22.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^22.13.14",
+    "tsx": "^4.20.3",
+    "typescript": "^5.8.3"
+  }
+}
