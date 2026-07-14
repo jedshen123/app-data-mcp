@@ -148,7 +148,12 @@ export function createAppDataMcpServer() {
     "Return read-only live data for a supported Metabase/PostHog asset, with local sampleData fallback.",
     {
       asset_id: z.string(),
-      params: z.record(z.unknown()).optional().describe("Optional query parameters for future platform connectors."),
+      params: z
+        .record(z.unknown())
+        .optional()
+        .describe(
+          "Optional read-only parameters. Prefer friendly names from asset.parameters, e.g. {date:'2026-07-01~2026-07-09', country:'US'}. Advanced Metabase users may pass native {parameters:[...]}."
+        ),
       limit: z.number().int().min(1).max(limits.maxResultRowLimit).default(limits.defaultResultRowLimit)
     },
     async ({ asset_id, params, limit }) => {
@@ -170,6 +175,8 @@ export function createAppDataMcpServer() {
             message: "This asset is hidden by the local metadata access snapshot."
           });
         }
+        const paramsError = validateAssetParams(asset, params);
+        if (paramsError) return paramsError;
         let liveFallbackWarning: string | undefined;
 
         if (asset.platform === "metabase" || asset.platform === "posthog") {
@@ -453,6 +460,29 @@ async function requireMetadataAccess(asset: import("./types.js").DataAsset) {
   }
 
   return null;
+}
+
+function validateAssetParams(asset: import("./types.js").DataAsset, params: Record<string, unknown> | undefined) {
+  if (!params || Array.isArray(params.parameters)) return null;
+  if (!asset.parameters?.length) return null;
+
+  const allowed = new Set(asset.parameters.map((parameter) => parameter.name));
+  const unknown = Object.keys(params).filter((key) => !allowed.has(key));
+  if (!unknown.length) return null;
+
+  return toTextPayload({
+    error: "unsupported_asset_parameters",
+    asset_id: asset.id,
+    unknown,
+    supportedParameters: asset.parameters.map((parameter) => ({
+      name: parameter.name,
+      type: parameter.type,
+      label: parameter.label,
+      description: parameter.description
+    })),
+    message:
+      "This asset only accepts declared friendly parameters. Use supported parameter names, or use platform-native params.parameters when needed."
+  });
 }
 
 async function buildCatalogFreshness(catalog: CatalogStore) {

@@ -51,7 +51,7 @@ DATA_MAX_RESULT_ROW_LIMIT=500
 DATA_MAX_RESPONSE_BYTES=1000000
 ```
 
-后续接真实 Metabase/PostHog connector 时，也必须把这些限制下推到 API 查询参数或结果截断逻辑里。`connector_status` 会返回当前 `dataLimits`。
+Metabase/PostHog connector 会继续在返回侧做行数和响应字节限制。`connector_status` 会返回当前 `dataLimits`。
 
 ## 真实数据读取
 
@@ -67,8 +67,63 @@ DATA_MAX_RESPONSE_BYTES=1000000
 
 - Dashboard 取数会限制最多执行 20 张卡片，可用 `DATA_MAX_DASHBOARD_CARDS` 调整。
 - 每张卡片/insight 结果继续受 `DATA_MAX_RESULT_ROW_LIMIT` 和 `DATA_MAX_RESPONSE_BYTES` 限制。
+- 资产声明了 `parameters` 时，可以给 `run_asset` 传维度/日期参数；未声明的友好参数会被拒绝，避免 AI 临时拼接不受控条件。
 - 如果 live connector 失败且资产里配置了 `sampleData`，会回退返回 sampleData。
 - 如果既无法 live 查询又没有 sampleData，会返回 `live_connector_failed` 或 `asset_not_runnable`。
+
+Metabase 友好参数示例：
+
+```json
+{
+  "asset_id": "metabase:card:81",
+  "params": {
+    "date": {
+      "from": "2026-07-01",
+      "to": "2026-07-09"
+    },
+    "country": "US"
+  },
+  "limit": 100
+}
+```
+
+Metabase 原生参数仍可透传：
+
+```json
+{
+  "asset_id": "metabase:card:81",
+  "params": {
+    "parameters": [
+      {
+        "type": "date/range",
+        "target": ["variable", ["template-tag", "date"]],
+        "value": "2026-07-01~2026-07-09"
+      }
+    ]
+  }
+}
+```
+
+PostHog insight 支持常见只读覆盖参数：
+
+```json
+{
+  "asset_id": "posthog:insight:abc123",
+  "params": {
+    "date_from": "-30d",
+    "date_to": "now",
+    "breakdown": "country",
+    "properties": [
+      {
+        "key": "country",
+        "value": "US",
+        "operator": "exact",
+        "type": "event"
+      }
+    ]
+  }
+}
+```
 
 ## 本地运行
 
@@ -248,7 +303,7 @@ POSTHOG_PROJECT_ID=...
 POSTHOG_PERSONAL_API_KEY=...
 ```
 
-当前 MVP 还没有真正调用 Metabase/PostHog API，`run_asset` 读取的是 `sampleData`。这些环境变量是给下一步 connector 使用的统一入口。
+`run_asset` 会使用这些环境变量调用 Metabase/PostHog 只读 API。资产不可 live 查询或连接失败时，才会按配置回退到本地 `sampleData`。
 
 如果没有拿到 `METABASE_API_KEY`，可以用 Metabase 用户名密码：
 
@@ -258,7 +313,7 @@ METABASE_USER=your-user@example.com
 METABASE_PASS=your-password
 ```
 
-后续 Metabase connector 会用这组配置调用 `POST /api/session` 换取 session id，再用 `X-Metabase-Session` 请求 dashboard/card API。也兼容旧变量名 `METABASE_USERNAME` 和 `METABASE_PASSWORD`。
+Metabase connector 会用这组配置调用 `POST /api/session` 换取 session id，再用 `X-Metabase-Session` 请求 dashboard/card API。也兼容旧变量名 `METABASE_USERNAME` 和 `METABASE_PASSWORD`。
 
 可以通过 MCP tool `connector_status` 检查配置是否齐全；它只返回是否配置和认证模式，不返回密钥或密码。
 
@@ -429,13 +484,14 @@ POSTHOG_PERSONAL_API_KEY=phx_...
 - `url`: 必填，保证每个结果都有原始出处。
 - `queryText`: SQL、PostHog insight 描述或指标口径。
 - `columns`: 字段说明。
+- `parameters`: 可传给 `run_asset` 的只读参数说明，例如日期、国家、渠道、PostHog properties 等。
 - `sourceRefs`: 上游表、事件、引用资产等血缘信息。
-- `sampleData`: MVP 阶段的本地样例数据，供 `run_asset` 返回。
+- `sampleData`: 本地样例数据；live connector 失败或不支持时可作为兜底。
 - `warnings`: 数据延迟、口径注意事项、MVP 限制。
 
 ## 下一步建议
 
-1. 用脚本从 Metabase API 同步 dashboard/card/question 元信息到 `config/assets.json`。
-2. 用脚本从 PostHog API 同步 dashboard/insight/event 元信息到 `config/assets.json`。
-3. 增加用户身份、权限过滤、审计日志和敏感字段脱敏。
+1. 接入 momcozy-data-agent 的受控语义层查询 API，作为 Metabase/PostHog curated assets 的 fallback。
+2. 增加 token 自助吊销/轮换页面。
+3. 增加敏感字段脱敏策略。
 4. 根据你们实际口径补充指标 registry 和数据负责人信息。

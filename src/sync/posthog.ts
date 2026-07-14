@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { getPostHogConfig } from "../config.js";
-import type { DataAsset } from "../types.js";
+import type { AssetParameter, DataAsset } from "../types.js";
 import { replacePlatformAssets } from "./catalogFile.js";
 import { asArray, fetchJson, getNumber, getObject, getString, isObject, joinUrl } from "./http.js";
 
@@ -103,6 +103,7 @@ function toInsightAsset(insight: Record<string, unknown>): DataAsset {
     url: joinUrl(config.baseUrl!, `/project/${config.projectId}/insights/${id}`),
     updatedAt: getString(insight.last_modified_at) ?? getString(insight.created_at),
     queryText: JSON.stringify(query ?? filters ?? {}, null, 2),
+    parameters: readPostHogInsightParameters(filters, query),
     sourceRefs: [
       {
         system: "posthog",
@@ -111,6 +112,48 @@ function toInsightAsset(insight: Record<string, unknown>): DataAsset {
     ],
     warnings: ["Synced metadata only. Query execution remains read-only and row-limited."]
   };
+}
+
+function readPostHogInsightParameters(
+  filters: Record<string, unknown> | undefined,
+  query: Record<string, unknown> | undefined
+): AssetParameter[] {
+  const parameters: AssetParameter[] = [
+    {
+      name: "date_from",
+      label: "Date from",
+      type: "date",
+      required: false,
+      defaultValue: filters?.date_from ?? query?.dateRange,
+      description: "PostHog date_from override, e.g. -30d or 2026-07-01."
+    },
+    {
+      name: "date_to",
+      label: "Date to",
+      type: "date",
+      required: false,
+      defaultValue: filters?.date_to,
+      description: "PostHog date_to override, e.g. now or 2026-07-09."
+    },
+    {
+      name: "properties",
+      label: "Properties",
+      type: "unknown",
+      required: false,
+      defaultValue: filters?.properties,
+      description: "PostHog properties filter array. Use the native PostHog property filter shape."
+    },
+    {
+      name: "breakdown",
+      label: "Breakdown",
+      type: "string",
+      required: false,
+      defaultValue: filters?.breakdown,
+      description: "PostHog breakdown override when supported by the saved insight type."
+    }
+  ];
+
+  return parameters;
 }
 
 function getUserName(value: unknown): string | undefined {

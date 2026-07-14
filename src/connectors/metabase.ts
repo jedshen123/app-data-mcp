@@ -2,7 +2,7 @@ import { getAuthConfig, getMetabaseConfig } from "../config.js";
 import { getMetabaseLoginUrl } from "../auth/loginRoutes.js";
 import { getStoredMetabaseSession } from "../auth/metabaseSessions.js";
 import { getRequestContext } from "../requestContext.js";
-import type { ColumnMeta, DataAsset } from "../types.js";
+import type { AssetParameter, ColumnMeta, DataAsset } from "../types.js";
 import { fetchJson, getNumber, getObject, getString, isObject, joinUrl } from "../sync/http.js";
 
 type MetabaseClient = {
@@ -28,7 +28,7 @@ export async function runMetabaseAsset(asset: DataAsset, options: RunOptions) {
   const client = await createMetabaseClient();
   if (asset.type === "card") {
     const cardId = getAssetNumericId(asset.id);
-    const result = await runMetabaseCard(client, cardId, options);
+    const result = await runMetabaseCard(client, cardId, asset.parameters, options);
     return {
       data: result,
       source: {
@@ -46,7 +46,7 @@ export async function runMetabaseAsset(asset: DataAsset, options: RunOptions) {
 
   if (asset.type === "dashboard") {
     const dashboardId = getAssetNumericId(asset.id);
-    const result = await runMetabaseDashboard(client, dashboardId, options);
+    const result = await runMetabaseDashboard(client, dashboardId, asset.parameters, options);
     return {
       data: result,
       source: {
@@ -127,8 +127,13 @@ async function createMetabaseClient(): Promise<MetabaseClient> {
   };
 }
 
-async function runMetabaseCard(client: MetabaseClient, cardId: string, options: RunOptions): Promise<NormalizedResult> {
-  const body = buildMetabaseQueryBody(options.params);
+async function runMetabaseCard(
+  client: MetabaseClient,
+  cardId: string,
+  assetParameters: AssetParameter[] | undefined,
+  options: RunOptions
+): Promise<NormalizedResult> {
+  const body = buildMetabaseQueryBody(options.params, assetParameters);
 
   try {
     const value = await fetchJson<unknown>(joinUrl(client.baseUrl, `/api/card/${cardId}/query/json`), {
@@ -153,7 +158,12 @@ async function runMetabaseCard(client: MetabaseClient, cardId: string, options: 
   }
 }
 
-async function runMetabaseDashboard(client: MetabaseClient, dashboardId: string, options: RunOptions) {
+async function runMetabaseDashboard(
+  client: MetabaseClient,
+  dashboardId: string,
+  assetParameters: AssetParameter[] | undefined,
+  options: RunOptions
+) {
   const dashboard = await fetchJson<Record<string, unknown>>(joinUrl(client.baseUrl, `/api/dashboard/${dashboardId}`), {
     headers: client.headers
   });
@@ -163,7 +173,7 @@ async function runMetabaseDashboard(client: MetabaseClient, dashboardId: string,
 
   for (const dashcard of dashcards) {
     try {
-      const result = await runMetabaseCard(client, dashcard.cardId, options);
+      const result = await runMetabaseCard(client, dashcard.cardId, assetParameters, options);
       cards.push({
         cardId: dashcard.cardId,
         title: dashcard.title,
@@ -189,9 +199,47 @@ async function runMetabaseDashboard(client: MetabaseClient, dashboardId: string,
   };
 }
 
-function buildMetabaseQueryBody(params?: Record<string, unknown>) {
-  const parameters = Array.isArray(params?.parameters) ? params.parameters : undefined;
-  return parameters ? { parameters } : {};
+function buildMetabaseQueryBody(params?: Record<string, unknown>, assetParameters: AssetParameter[] = []) {
+  if (!params) return {};
+
+  const parameters = Array.isArray(params.parameters)
+    ? params.parameters
+    : buildNamedMetabaseParameters(params, assetParameters);
+  return parameters.length ? { parameters } : {};
+}
+
+function buildNamedMetabaseParameters(params: Record<string, unknown>, assetParameters: AssetParameter[]) {
+  const reservedKeys = new Set(["parameters"]);
+  return Object.entries(params)
+    .filter(([name, value]) => !reservedKeys.has(name) && value !== undefined && value !== null && value !== "")
+    .map(([name, value]) => {
+      const definition = assetParameters.find((parameter) => parameter.name === name);
+      const type = metabaseParameterType(definition, value);
+      return {
+        type,
+        target: definition?.platformTarget ?? ["variable", ["template-tag", name]],
+        value: normalizeMetabaseParameterValue(value, type)
+      };
+    });
+}
+
+function metabaseParameterType(parameter: AssetParameter | undefined, value: unknown): string {
+  if (parameter?.raw && typeof parameter.raw.type === "string") return parameter.raw.type;
+  if (parameter?.type === "date_range") return "date/range";
+  if (parameter?.type === "date") return "date/single";
+  if (parameter?.type === "number") return "number/=";
+  if (parameter?.type === "boolean") return "category";
+  if (Array.isArray(value)) return "category";
+  return "category";
+}
+
+function normalizeMetabaseParameterValue(value: unknown, type: string): unknown {
+  if (type === "date/range" && isObject(value)) {
+    const start = getString(value.from) ?? getString(value.start) ?? getString(value.date_from);
+    const end = getString(value.to) ?? getString(value.end) ?? getString(value.date_to);
+    if (start && end) return `${start}~${end}`;
+  }
+  return value;
 }
 
 function normalizeJsonRows(value: unknown, limit: number): NormalizedResult {

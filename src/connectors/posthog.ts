@@ -3,6 +3,7 @@ import type { ColumnMeta, DataAsset } from "../types.js";
 import { fetchJson, getObject, getString, isObject, joinUrl } from "../sync/http.js";
 
 type RunOptions = {
+  params?: Record<string, unknown>;
   limit: number;
 };
 
@@ -26,8 +27,9 @@ export async function runPostHogAsset(asset: DataAsset, options: RunOptions) {
   }
 
   const insightId = getAssetIdSuffix(asset.id);
+  const insightUrl = buildPostHogInsightUrl(config.baseUrl, config.projectId, insightId, options.params);
   const insight = await fetchJson<Record<string, unknown>>(
-    joinUrl(config.baseUrl, `/api/projects/${config.projectId}/insights/${insightId}/?refresh=blocking`),
+    insightUrl,
     {
       headers: {
         authorization: `Bearer ${config.personalApiKey}`
@@ -46,9 +48,33 @@ export async function runPostHogAsset(asset: DataAsset, options: RunOptions) {
     warnings: [
       ...(asset.warnings ?? []),
       "Live data returned from PostHog using a read-only insight endpoint.",
+      ...(options.params && Object.keys(options.params).length
+        ? ["PostHog insight parameter overrides were sent as read-only query parameters when supported by PostHog."]
+        : []),
       ...(result.truncated ? [`Result truncated to ${options.limit} rows.`] : [])
     ]
   };
+}
+
+function buildPostHogInsightUrl(
+  baseUrl: string,
+  projectId: string,
+  insightId: string,
+  params: Record<string, unknown> | undefined
+): string {
+  const url = new URL(joinUrl(baseUrl, `/api/projects/${projectId}/insights/${insightId}/`));
+  url.searchParams.set("refresh", "blocking");
+
+  if (!params) return url.toString();
+  for (const key of ["date_from", "date_to", "breakdown"]) {
+    const value = params[key];
+    if (typeof value === "string" && value.trim()) url.searchParams.set(key, value);
+  }
+  if (Array.isArray(params.properties)) {
+    url.searchParams.set("properties", JSON.stringify(params.properties));
+  }
+
+  return url.toString();
 }
 
 function normalizePostHogInsight(insight: Record<string, unknown>, limit: number): NormalizedResult {

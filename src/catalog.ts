@@ -37,6 +37,18 @@ const accessSnapshotSchema = z.object({
   raw: z.record(z.unknown()).optional()
 });
 
+const parameterSchema = z.object({
+  name: z.string(),
+  label: z.string().optional(),
+  type: z.enum(["date", "date_range", "category", "number", "string", "boolean", "unknown"]),
+  required: z.boolean().optional(),
+  defaultValue: z.unknown().optional(),
+  allowedValues: z.array(z.string()).optional(),
+  description: z.string().optional(),
+  platformTarget: z.unknown().optional(),
+  raw: z.record(z.unknown()).optional()
+});
+
 const assetSchema = z.object({
   id: z.string(),
   platform: z.enum(["metabase", "posthog", "local"]),
@@ -59,6 +71,7 @@ const assetSchema = z.object({
       rows: z.array(z.record(z.unknown()))
     })
     .optional(),
+  parameters: z.array(parameterSchema).optional(),
   access: accessSnapshotSchema.optional(),
   warnings: z.array(z.string()).optional()
 });
@@ -175,7 +188,8 @@ export class CatalogStore {
             asset.owner,
             asset.tags.join(" "),
             asset.queryText,
-            asset.columns?.map((column) => `${column.name} ${column.description ?? ""}`).join(" ")
+            asset.columns?.map((column) => `${column.name} ${column.description ?? ""}`).join(" "),
+            asset.parameters?.map((parameter) => `${parameter.name} ${parameter.label ?? ""} ${parameter.description ?? ""}`).join(" ")
           ]
             .filter(Boolean)
             .join(" ")

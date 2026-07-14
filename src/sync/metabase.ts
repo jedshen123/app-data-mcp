@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { getMetabaseConfig, getSyncFreshnessConfig } from "../config.js";
-import type { ColumnMeta, DataAccessSnapshot, DataAsset } from "../types.js";
+import type { AssetParameter, ColumnMeta, DataAccessSnapshot, DataAsset } from "../types.js";
 import { replacePlatformAssets } from "./catalogFile.js";
 import { asArray, fetchJson, getNumber, getObject, getString, joinUrl } from "./http.js";
 
@@ -94,7 +94,9 @@ async function toDashboardAsset(client: MetabaseClient, dashboard: Record<string
   const name = getString(dashboard.name) ?? getString(dashboard.title) ?? `Metabase dashboard ${id}`;
   const description = getString(dashboard.description);
   const collection = getObject(dashboard.collection);
-  const children = await readDashboardChildren(client, id);
+  const detail = await readDashboardDetail(client, id);
+  const children = readDashboardChildren(detail);
+  const parameters = readMetabaseDashboardParameters(detail);
   const dashboardId = getNumber(dashboard.id);
 
   return {
@@ -109,6 +111,7 @@ async function toDashboardAsset(client: MetabaseClient, dashboard: Record<string
     url: joinUrl(client.baseUrl, `/dashboard/${id}`),
     updatedAt: getString(dashboard.updated_at) ?? getString(dashboard.created_at),
     children,
+    parameters,
     sourceRefs: [
       {
         system: "metabase",
@@ -122,25 +125,28 @@ async function toDashboardAsset(client: MetabaseClient, dashboard: Record<string
   };
 }
 
-async function readDashboardChildren(client: MetabaseClient, dashboardId: string): Promise<string[] | undefined> {
+async function readDashboardDetail(client: MetabaseClient, dashboardId: string): Promise<Record<string, unknown> | undefined> {
   try {
-    const detail = await fetchJson<Record<string, unknown>>(joinUrl(client.baseUrl, `/api/dashboard/${dashboardId}`), {
+    return await fetchJson<Record<string, unknown>>(joinUrl(client.baseUrl, `/api/dashboard/${dashboardId}`), {
       headers: client.headers
     });
-    const dashcards = Array.isArray(detail.dashcards)
-      ? detail.dashcards
-      : Array.isArray(detail.ordered_cards)
-        ? detail.ordered_cards
-        : [];
-    const children = dashcards
-      .filter((dashcard): dashcard is Record<string, unknown> => typeof dashcard === "object" && dashcard !== null)
-      .map((dashcard) => getNumber(dashcard.card_id) ?? getNumber(getObject(dashcard.card)?.id))
-      .filter((cardId): cardId is number => cardId !== undefined)
-      .map((cardId) => `metabase:card:${cardId}`);
-    return children.length ? children : undefined;
   } catch {
     return undefined;
   }
+}
+
+function readDashboardChildren(detail: Record<string, unknown> | undefined): string[] | undefined {
+  const dashcards = Array.isArray(detail?.dashcards)
+    ? detail.dashcards
+    : Array.isArray(detail?.ordered_cards)
+      ? detail.ordered_cards
+      : [];
+  const children = dashcards
+    .filter((dashcard): dashcard is Record<string, unknown> => typeof dashcard === "object" && dashcard !== null)
+    .map((dashcard) => getNumber(dashcard.card_id) ?? getNumber(getObject(dashcard.card)?.id))
+    .filter((cardId): cardId is number => cardId !== undefined)
+    .map((cardId) => `metabase:card:${cardId}`);
+  return children.length ? children : undefined;
 }
 
 function toCardAsset(client: MetabaseClient, card: Record<string, unknown>): DataAsset {
@@ -151,6 +157,7 @@ function toCardAsset(client: MetabaseClient, card: Record<string, unknown>): Dat
   const queryText = getString(nativeQuery?.query) ?? JSON.stringify(datasetQuery ?? {}, null, 2);
   const columns = readMetabaseColumns(card);
   const collection = getObject(card.collection);
+  const parameters = readMetabaseCardParameters(card);
   const dashboardId =
     getNumber(card.dashboard_id) ??
     getNumber(card.dashboardId) ??
@@ -169,6 +176,7 @@ function toCardAsset(client: MetabaseClient, card: Record<string, unknown>): Dat
     updatedAt: getString(card.updated_at) ?? getString(card.created_at),
     queryText,
     columns,
+    parameters,
     sourceRefs: [
       {
         system: "metabase",
@@ -180,6 +188,93 @@ function toCardAsset(client: MetabaseClient, card: Record<string, unknown>): Dat
     }),
     warnings: ["Synced metadata only. Query execution remains read-only and row-limited."]
   };
+}
+
+function readMetabaseDashboardParameters(detail: Record<string, unknown> | undefined): AssetParameter[] | undefined {
+  const parameters = asArray<Record<string, unknown>>(detail?.parameters);
+  const mapped = parameters
+    .flatMap((parameter): AssetParameter[] => {
+      const id = getString(parameter.id) ?? getString(parameter.slug) ?? getString(parameter.name);
+      if (!id) return [];
+      return [{
+        name: id,
+        label: getString(parameter.name) ?? getString(parameter.label) ?? id,
+        type: normalizeMetabaseParameterType(getString(parameter.type)),
+        required: Boolean(parameter.required),
+        defaultValue: parameter.default,
+        platformTarget: parameter.target,
+        raw: pickRaw(parameter, ["id", "slug", "name", "type", "target", "default"])
+      }];
+    });
+  return mapped.length ? dedupeParameters(mapped) : undefined;
+}
+
+function readMetabaseCardParameters(card: Record<string, unknown>): AssetParameter[] | undefined {
+  const explicitParameters = asArray<Record<string, unknown>>(card.parameters);
+  const datasetQuery = getObject(card.dataset_query);
+  const nativeQuery = getObject(datasetQuery?.native);
+  const templateTags = getObject(nativeQuery?.["template-tags"]);
+  const fromExplicit = explicitParameters
+    .flatMap((parameter): AssetParameter[] => {
+      const id = getString(parameter.id) ?? getString(parameter.slug) ?? getString(parameter.name);
+      if (!id) return [];
+      return [{
+        name: id,
+        label: getString(parameter.name) ?? getString(parameter.label) ?? id,
+        type: normalizeMetabaseParameterType(getString(parameter.type)),
+        required: Boolean(parameter.required),
+        defaultValue: parameter.default,
+        platformTarget: parameter.target,
+        raw: pickRaw(parameter, ["id", "slug", "name", "type", "target", "default"])
+      }];
+    });
+  const fromTemplateTags = Object.entries(templateTags ?? {})
+    .map(([name, raw]) => {
+      const tag = getObject(raw);
+      return {
+        name,
+        label: getString(tag?.["display-name"]) ?? getString(tag?.name) ?? name,
+        type: normalizeMetabaseParameterType(getString(tag?.type)),
+        required: tag?.required === true,
+        defaultValue: tag?.default,
+        platformTarget: ["variable", ["template-tag", name]],
+        raw: pickRaw(tag ?? {}, ["name", "display-name", "type", "required", "default"])
+      } satisfies AssetParameter;
+    });
+
+  const merged = dedupeParameters([...fromExplicit, ...fromTemplateTags]);
+  return merged.length ? merged : undefined;
+}
+
+function normalizeMetabaseParameterType(type: string | undefined): AssetParameter["type"] {
+  const normalized = (type ?? "").toLowerCase();
+  if (normalized.includes("date/range") || normalized.includes("daterange")) return "date_range";
+  if (normalized.includes("date")) return "date";
+  if (normalized.includes("number") || normalized.includes("int") || normalized.includes("float")) return "number";
+  if (normalized.includes("bool")) return "boolean";
+  if (normalized.includes("category") || normalized.includes("dimension") || normalized.includes("field")) return "category";
+  if (normalized.includes("text") || normalized.includes("string")) return "string";
+  return "unknown";
+}
+
+function dedupeParameters(parameters: AssetParameter[]): AssetParameter[] {
+  const byName = new Map<string, AssetParameter>();
+  for (const parameter of parameters) {
+    const existing = byName.get(parameter.name);
+    byName.set(parameter.name, {
+      ...parameter,
+      platformTarget: existing?.platformTarget ?? parameter.platformTarget,
+      raw: {
+        ...(parameter.raw ?? {}),
+        ...(existing?.raw ?? {})
+      }
+    });
+  }
+  return Array.from(byName.values()).sort((left, right) => left.name.localeCompare(right.name));
+}
+
+function pickRaw(value: Record<string, unknown>, keys: string[]): Record<string, unknown> {
+  return Object.fromEntries(keys.map((key) => [key, value[key]]).filter(([, item]) => item !== undefined));
 }
 
 function buildMetabaseAccessSnapshot(

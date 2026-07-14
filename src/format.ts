@@ -13,6 +13,13 @@ export function summarizeAsset(asset: DataAsset) {
     url: asset.url,
     updatedAt: asset.updatedAt,
     popularity: asset.popularity,
+    parameters: asset.parameters?.map((parameter) => ({
+      name: parameter.name,
+      label: parameter.label,
+      type: parameter.type,
+      required: parameter.required,
+      description: parameter.description
+    })),
     access: asset.access
       ? {
           visibility: asset.access.visibility,

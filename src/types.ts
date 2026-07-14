@@ -30,6 +30,18 @@ export type SampleData = {
   rows: Record<string, unknown>[];
 };
 
+export type AssetParameter = {
+  name: string;
+  label?: string;
+  type: "date" | "date_range" | "category" | "number" | "string" | "boolean" | "unknown";
+  required?: boolean;
+  defaultValue?: unknown;
+  allowedValues?: string[];
+  description?: string;
+  platformTarget?: unknown;
+  raw?: Record<string, unknown>;
+};
+
 export type DataAccessSnapshot = {
   source: "metabase-sync" | "posthog-sync" | "local-config";
   syncedAt: string;
@@ -63,6 +75,7 @@ export type DataAsset = {
   columns?: ColumnMeta[];
   sourceRefs?: SourceRef[];
   sampleData?: SampleData;
+  parameters?: AssetParameter[];
   access?: DataAccessSnapshot;
   warnings?: string[];
 };
