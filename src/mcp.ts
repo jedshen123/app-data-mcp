@@ -15,6 +15,7 @@ import {
   getAuthConfig,
   getDataLimitConfig,
   getMetabaseConfig,
+  getMetabasePublicUrl,
   getPostHogConfig,
   getSyncFreshnessConfig
 } from "./config.js";
@@ -69,6 +70,7 @@ export function createAppDataMcpServer() {
           note: "Results come from local metadata config and are filtered by local access snapshots. Use get_asset, trace_asset, or run_asset with an id for details.",
           nextSteps: [
             "If a curated Metabase/PostHog asset answers the question, prefer run_asset.",
+            "For Metabase dashboards, inspect parameters and dashboardParameterMappings to decide whether filters can answer the user's question.",
             "If no curated asset matches or custom breakdowns are needed, use semantic tools when configured."
           ]
         });
@@ -371,12 +373,14 @@ export function createAppDataMcpServer() {
                   configured: false,
                   authMode: "missing",
                   baseUrlConfigured: Boolean(metabase.baseUrl),
+                  publicUrlConfigured: Boolean(getMetabasePublicUrl()),
                   missing: metabase.missing
                 }
               : {
                   configured: true,
                   authMode: metabase.mode,
-                  baseUrl: metabase.baseUrl
+                  baseUrl: metabase.baseUrl,
+                  publicUrl: getMetabasePublicUrl() ?? metabase.baseUrl
                 },
           posthog: {
             configured: Boolean(posthog.baseUrl && posthog.projectId && posthog.personalApiKey),

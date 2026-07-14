@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
-import { getAssetFilePath, getDataLimitConfig } from "./config.js";
+import { getAssetFilePath, getDataLimitConfig, getMetabasePublicUrl } from "./config.js";
 import type { AssetCatalog, DataAsset, DataAssetType, DataPlatform } from "./types.js";
 
 const columnSchema = z.object({
@@ -49,6 +49,17 @@ const parameterSchema = z.object({
   raw: z.record(z.unknown()).optional()
 });
 
+const dashboardParameterMappingSchema = z.object({
+  parameterId: z.string(),
+  parameterName: z.string().optional(),
+  cardId: z.string(),
+  dashcardId: z.string().optional(),
+  cardTitle: z.string().optional(),
+  target: z.unknown().optional(),
+  parameterType: z.string().optional(),
+  raw: z.record(z.unknown()).optional()
+});
+
 const assetSchema = z.object({
   id: z.string(),
   platform: z.enum(["metabase", "posthog", "local"]),
@@ -72,6 +83,7 @@ const assetSchema = z.object({
     })
     .optional(),
   parameters: z.array(parameterSchema).optional(),
+  dashboardParameterMappings: z.array(dashboardParameterMappingSchema).optional(),
   access: accessSnapshotSchema.optional(),
   warnings: z.array(z.string()).optional()
 });
@@ -118,8 +130,8 @@ export class CatalogStore {
     }
 
     const parsed = catalogSchema.parse(JSON.parse(raw));
-    this.catalog = parsed;
-    return parsed;
+    this.catalog = rewriteCatalogPublicUrls(parsed);
+    return this.catalog;
   }
 
   async getCatalog(): Promise<AssetCatalog> {
@@ -189,7 +201,10 @@ export class CatalogStore {
             asset.tags.join(" "),
             asset.queryText,
             asset.columns?.map((column) => `${column.name} ${column.description ?? ""}`).join(" "),
-            asset.parameters?.map((parameter) => `${parameter.name} ${parameter.label ?? ""} ${parameter.description ?? ""}`).join(" ")
+            asset.parameters?.map((parameter) => `${parameter.name} ${parameter.label ?? ""} ${parameter.description ?? ""}`).join(" "),
+            asset.dashboardParameterMappings
+              ?.map((mapping) => `${mapping.parameterId} ${mapping.parameterName ?? ""} ${mapping.cardTitle ?? ""}`)
+              .join(" ")
           ]
             .filter(Boolean)
             .join(" ")
@@ -236,4 +251,39 @@ function scoreAsset(asset: DataAsset, terms: string[]): number {
     if (queryText.includes(term)) score += 4;
     return score;
   }, popularity / 10);
+}
+
+function rewriteCatalogPublicUrls(catalog: AssetCatalog): AssetCatalog {
+  const metabasePublicUrl = getMetabasePublicUrl();
+  if (!metabasePublicUrl) return catalog;
+
+  return {
+    ...catalog,
+    assets: catalog.assets.map((asset) => {
+      if (asset.platform !== "metabase") return asset;
+      return {
+        ...asset,
+        url: rewriteUrlBase(asset.url, metabasePublicUrl),
+        sourceRefs: asset.sourceRefs?.map((sourceRef) => ({
+          ...sourceRef,
+          url: sourceRef.url ? rewriteUrlBase(sourceRef.url, metabasePublicUrl) : sourceRef.url
+        }))
+      };
+    })
+  };
+}
+
+function rewriteUrlBase(url: string, publicBaseUrl: string): string {
+  try {
+    const parsed = new URL(url);
+    return joinPublicUrl(publicBaseUrl, `${parsed.pathname}${parsed.search}${parsed.hash}`);
+  } catch {
+    return url;
+  }
+}
+
+function joinPublicUrl(baseUrl: string, path: string): string {
+  const base = baseUrl.endsWith("/") ? baseUrl.slice(0, -1) : baseUrl;
+  const suffix = path.startsWith("/") ? path : `/${path}`;
+  return `${base}${suffix}`;
 }

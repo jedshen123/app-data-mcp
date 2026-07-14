@@ -20,6 +20,12 @@ export function summarizeAsset(asset: DataAsset) {
       required: parameter.required,
       description: parameter.description
     })),
+    dashboardParameterMappings: asset.dashboardParameterMappings
+      ? {
+          count: asset.dashboardParameterMappings.length,
+          byParameter: summarizeDashboardParameterMappings(asset)
+        }
+      : undefined,
     access: asset.access
       ? {
           visibility: asset.access.visibility,
@@ -31,6 +37,22 @@ export function summarizeAsset(asset: DataAsset) {
       : undefined,
     warnings: asset.warnings
   };
+}
+
+function summarizeDashboardParameterMappings(asset: DataAsset) {
+  const mappings = asset.dashboardParameterMappings ?? [];
+  return asset.parameters?.map((parameter) => {
+    const parameterMappings = mappings.filter((mapping) => mapping.parameterId === parameter.name);
+    return {
+      name: parameter.name,
+      label: parameter.label,
+      mappedCardCount: new Set(parameterMappings.map((mapping) => mapping.cardId)).size,
+      mappedCards: parameterMappings.slice(0, 10).map((mapping) => ({
+        cardId: mapping.cardId,
+        title: mapping.cardTitle
+      }))
+    };
+  });
 }
 
 export function toTextPayload(value: unknown) {

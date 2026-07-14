@@ -119,6 +119,10 @@ export function getMetabaseConfig(): MetabaseAuthConfig {
   };
 }
 
+export function getMetabasePublicUrl(): string | undefined {
+  return process.env.METABASE_PUBLIC_URL ?? process.env.METABASE_EXTERNAL_URL;
+}
+
 export function getPostHogConfig() {
   return {
     baseUrl: process.env.POSTHOG_BASE_URL,

@@ -42,6 +42,17 @@ export type AssetParameter = {
   raw?: Record<string, unknown>;
 };
 
+export type DashboardParameterMapping = {
+  parameterId: string;
+  parameterName?: string;
+  cardId: string;
+  dashcardId?: string;
+  cardTitle?: string;
+  target?: unknown;
+  parameterType?: string;
+  raw?: Record<string, unknown>;
+};
+
 export type DataAccessSnapshot = {
   source: "metabase-sync" | "posthog-sync" | "local-config";
   syncedAt: string;
@@ -76,6 +87,7 @@ export type DataAsset = {
   sourceRefs?: SourceRef[];
   sampleData?: SampleData;
   parameters?: AssetParameter[];
+  dashboardParameterMappings?: DashboardParameterMapping[];
   access?: DataAccessSnapshot;
   warnings?: string[];
 };

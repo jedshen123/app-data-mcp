@@ -1,11 +1,18 @@
 #!/usr/bin/env node
-import { getMetabaseConfig, getSyncFreshnessConfig } from "../config.js";
-import type { AssetParameter, ColumnMeta, DataAccessSnapshot, DataAsset } from "../types.js";
+import { getMetabaseConfig, getMetabasePublicUrl, getSyncFreshnessConfig } from "../config.js";
+import type {
+  AssetParameter,
+  ColumnMeta,
+  DashboardParameterMapping,
+  DataAccessSnapshot,
+  DataAsset
+} from "../types.js";
 import { replacePlatformAssets } from "./catalogFile.js";
 import { asArray, fetchJson, getNumber, getObject, getString, joinUrl } from "./http.js";
 
 type MetabaseClient = {
   baseUrl: string;
+  publicUrl: string;
   headers: HeadersInit;
 };
 
@@ -46,6 +53,7 @@ async function createMetabaseClient(syncConfig: Exclude<typeof config, { mode: "
   if (syncConfig.mode === "api-key") {
     return {
       baseUrl: syncConfig.baseUrl,
+      publicUrl: getMetabasePublicUrl() ?? syncConfig.baseUrl,
       headers: {
         "x-api-key": syncConfig.apiKey
       }
@@ -65,6 +73,7 @@ async function createMetabaseClient(syncConfig: Exclude<typeof config, { mode: "
 
   return {
     baseUrl: syncConfig.baseUrl,
+    publicUrl: getMetabasePublicUrl() ?? syncConfig.baseUrl,
     headers: {
       "X-Metabase-Session": session.id
     }
@@ -97,6 +106,7 @@ async function toDashboardAsset(client: MetabaseClient, dashboard: Record<string
   const detail = await readDashboardDetail(client, id);
   const children = readDashboardChildren(detail);
   const parameters = readMetabaseDashboardParameters(detail);
+  const dashboardParameterMappings = readMetabaseDashboardParameterMappings(detail, parameters);
   const dashboardId = getNumber(dashboard.id);
 
   return {
@@ -108,14 +118,15 @@ async function toDashboardAsset(client: MetabaseClient, dashboard: Record<string
     businessDomain: getString(collection?.name),
     tags: compact(["metabase", "dashboard", getString(collection?.name)]),
     owner: getCreatorName(dashboard),
-    url: joinUrl(client.baseUrl, `/dashboard/${id}`),
+    url: joinUrl(client.publicUrl, `/dashboard/${id}`),
     updatedAt: getString(dashboard.updated_at) ?? getString(dashboard.created_at),
     children,
     parameters,
+    dashboardParameterMappings,
     sourceRefs: [
       {
         system: "metabase",
-        url: joinUrl(client.baseUrl, `/dashboard/${id}`)
+        url: joinUrl(client.publicUrl, `/dashboard/${id}`)
       }
     ],
     access: buildMetabaseAccessSnapshot(dashboard, {
@@ -149,6 +160,51 @@ function readDashboardChildren(detail: Record<string, unknown> | undefined): str
   return children.length ? children : undefined;
 }
 
+function readMetabaseDashboardParameterMappings(
+  detail: Record<string, unknown> | undefined,
+  parameters: AssetParameter[] | undefined
+): DashboardParameterMapping[] | undefined {
+  const parameterById = new Map((parameters ?? []).map((parameter) => [parameter.name, parameter]));
+  const dashcards = readRawDashboardCards(detail);
+  const mappings = dashcards.flatMap((dashcard): DashboardParameterMapping[] => {
+    const card = getObject(dashcard.card);
+    const cardId = getNumber(dashcard.card_id) ?? getNumber(card?.id);
+    if (cardId === undefined) return [];
+
+    const dashcardId = getNumber(dashcard.id) ?? getNumber(dashcard.dashboard_card_id);
+    const cardTitle = getString(card?.name) ?? getString(dashcard.title);
+    return asArray<Record<string, unknown>>(dashcard.parameter_mappings).flatMap((mapping) => {
+      const parameterId =
+        getString(mapping.parameter_id) ??
+        getString(mapping.parameterId) ??
+        getString(getObject(mapping.parameter)?.id);
+      if (!parameterId) return [];
+      const parameter = parameterById.get(parameterId);
+      return [{
+        parameterId,
+        parameterName: parameter?.label ?? parameter?.name,
+        cardId: String(cardId),
+        dashcardId: dashcardId === undefined ? undefined : String(dashcardId),
+        cardTitle,
+        target: mapping.target,
+        parameterType: getString(mapping.parameter_type) ?? getString(mapping.parameterType) ?? getString(parameter?.raw?.type),
+        raw: pickRaw(mapping, ["parameter_id", "card_id", "target", "parameter_type"])
+      }];
+    });
+  });
+
+  return mappings.length ? mappings : undefined;
+}
+
+function readRawDashboardCards(detail: Record<string, unknown> | undefined): Record<string, unknown>[] {
+  const dashcards = Array.isArray(detail?.dashcards)
+    ? detail.dashcards
+    : Array.isArray(detail?.ordered_cards)
+      ? detail.ordered_cards
+      : [];
+  return dashcards.filter((dashcard): dashcard is Record<string, unknown> => typeof dashcard === "object" && dashcard !== null);
+}
+
 function toCardAsset(client: MetabaseClient, card: Record<string, unknown>): DataAsset {
   const id = String(getNumber(card.id) ?? getString(card.id) ?? "");
   const name = getString(card.name) ?? getString(card.title) ?? `Metabase card ${id}`;
@@ -172,7 +228,7 @@ function toCardAsset(client: MetabaseClient, card: Record<string, unknown>): Dat
     businessDomain: getString(collection?.name),
     tags: compact(["metabase", "card", getString(card.display), getString(collection?.name)]),
     owner: getCreatorName(card),
-    url: joinUrl(client.baseUrl, `/question/${id}`),
+    url: joinUrl(client.publicUrl, `/question/${id}`),
     updatedAt: getString(card.updated_at) ?? getString(card.created_at),
     queryText,
     columns,
@@ -180,7 +236,7 @@ function toCardAsset(client: MetabaseClient, card: Record<string, unknown>): Dat
     sourceRefs: [
       {
         system: "metabase",
-        url: joinUrl(client.baseUrl, `/question/${id}`)
+        url: joinUrl(client.publicUrl, `/question/${id}`)
       }
     ],
     access: buildMetabaseAccessSnapshot(card, {

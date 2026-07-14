@@ -2,7 +2,7 @@ import { getAuthConfig, getMetabaseConfig } from "../config.js";
 import { getMetabaseLoginUrl } from "../auth/loginRoutes.js";
 import { getStoredMetabaseSession } from "../auth/metabaseSessions.js";
 import { getRequestContext } from "../requestContext.js";
-import type { AssetParameter, ColumnMeta, DataAsset } from "../types.js";
+import type { AssetParameter, ColumnMeta, DashboardParameterMapping, DataAsset } from "../types.js";
 import { fetchJson, getNumber, getObject, getString, isObject, joinUrl } from "../sync/http.js";
 
 type MetabaseClient = {
@@ -46,7 +46,7 @@ export async function runMetabaseAsset(asset: DataAsset, options: RunOptions) {
 
   if (asset.type === "dashboard") {
     const dashboardId = getAssetNumericId(asset.id);
-    const result = await runMetabaseDashboard(client, dashboardId, asset.parameters, options);
+    const result = await runMetabaseDashboard(client, dashboardId, asset, options);
     return {
       data: result,
       source: {
@@ -161,22 +161,36 @@ async function runMetabaseCard(
 async function runMetabaseDashboard(
   client: MetabaseClient,
   dashboardId: string,
-  assetParameters: AssetParameter[] | undefined,
+  asset: DataAsset,
   options: RunOptions
 ) {
   const dashboard = await fetchJson<Record<string, unknown>>(joinUrl(client.baseUrl, `/api/dashboard/${dashboardId}`), {
     headers: client.headers
   });
 
-  const dashcards = readDashboardCards(dashboard).slice(0, getMaxDashboardCards());
+  const dashboardParameters = readDashboardParameters(dashboard, asset.parameters);
+  const dashcards = readDashboardCards(dashboard)
+    .slice(0, getMaxDashboardCards())
+    .map((dashcard) => ({
+      ...dashcard,
+      parameterMappings: dashcard.parameterMappings.length
+        ? dashcard.parameterMappings
+        : (asset.dashboardParameterMappings ?? []).filter((mapping) => mapping.cardId === dashcard.cardId)
+    }));
   const cards = [];
 
   for (const dashcard of dashcards) {
+    const parameterPlan = buildDashboardCardParameterPlan(options.params, dashboardParameters, dashcard.parameterMappings);
+
     try {
-      const result = await runMetabaseCard(client, dashcard.cardId, assetParameters, options);
+      const result = await runMetabaseCard(client, dashcard.cardId, undefined, {
+        ...options,
+        params: parameterPlan.params
+      });
       cards.push({
         cardId: dashcard.cardId,
         title: dashcard.title,
+        parameterMappingStatus: parameterPlan.status,
         data: result,
         error: null
       });
@@ -184,6 +198,7 @@ async function runMetabaseDashboard(
       cards.push({
         cardId: dashcard.cardId,
         title: dashcard.title,
+        parameterMappingStatus: parameterPlan.status,
         data: null,
         error: error instanceof Error ? error.message : String(error)
       });
@@ -193,10 +208,114 @@ async function runMetabaseDashboard(
   return {
     dashboardId,
     title: getString(dashboard.name) ?? `Metabase dashboard ${dashboardId}`,
+    requestedParameters: getRequestedParameterNames(options.params),
+    parameterCoverage: buildDashboardParameterCoverage(options.params, dashcards),
     cardCount: cards.length,
     maxCardsApplied: getMaxDashboardCards(),
     cards
   };
+}
+
+function buildDashboardCardParameterPlan(
+  params: Record<string, unknown> | undefined,
+  dashboardParameters: AssetParameter[],
+  mappings: DashboardParameterMapping[]
+) {
+  if (!params || Object.keys(params).length === 0) {
+    return {
+      params: undefined,
+      status: {
+        status: "no_params",
+        requestedParameters: [],
+        appliedParameters: [],
+        unmappedParameters: [],
+        mappedParametersAvailable: mappings.map((mapping) => mapping.parameterId)
+      }
+    };
+  }
+
+  if (Array.isArray(params.parameters)) {
+    return {
+      params,
+      status: {
+        status: "native_parameters",
+        requestedParameters: ["parameters"],
+        appliedParameters: ["parameters"],
+        unmappedParameters: [],
+        mappedParametersAvailable: mappings.map((mapping) => mapping.parameterId),
+        note: "Native Metabase params.parameters were passed through; friendly dashboard mapping coverage cannot be inferred."
+      }
+    };
+  }
+
+  const requestedParameters = getRequestedParameterNames(params);
+  const mappingByParameter = new Map(mappings.map((mapping) => [mapping.parameterId, mapping]));
+  const metabaseParameters = [];
+  const appliedParameters = [];
+  const unmappedParameters = [];
+
+  for (const name of requestedParameters) {
+    const value = params[name];
+    const mapping = mappingByParameter.get(name);
+    if (!mapping?.target) {
+      unmappedParameters.push(name);
+      continue;
+    }
+
+    const definition = dashboardParameters.find((parameter) => parameter.name === name);
+    const type = mapping.parameterType ?? metabaseParameterType(definition, value);
+    metabaseParameters.push({
+      type,
+      target: mapping.target,
+      value: normalizeMetabaseParameterValue(value, type)
+    });
+    appliedParameters.push(name);
+  }
+
+  return {
+    params: metabaseParameters.length ? { parameters: metabaseParameters } : undefined,
+    status: {
+      status:
+        appliedParameters.length === 0
+          ? "unmapped"
+          : unmappedParameters.length
+            ? "partially_mapped"
+            : "mapped",
+      requestedParameters,
+      appliedParameters,
+      unmappedParameters,
+      mappedParametersAvailable: mappings.map((mapping) => mapping.parameterId)
+    }
+  };
+}
+
+function buildDashboardParameterCoverage(
+  params: Record<string, unknown> | undefined,
+  dashcards: ReturnType<typeof readDashboardCards>
+) {
+  const requestedParameters = getRequestedParameterNames(params);
+  if (!requestedParameters.length) return [];
+
+  return requestedParameters.map((parameter) => {
+    const mappedCards = dashcards.filter((dashcard) =>
+      dashcard.parameterMappings.some((mapping) => mapping.parameterId === parameter)
+    );
+    return {
+      parameter,
+      mappedCardCount: mappedCards.length,
+      mappedCards: mappedCards.map((dashcard) => ({
+        cardId: dashcard.cardId,
+        title: dashcard.title
+      }))
+    };
+  });
+}
+
+function getRequestedParameterNames(params: Record<string, unknown> | undefined): string[] {
+  if (!params || Array.isArray(params.parameters)) return [];
+  return Object.entries(params)
+    .filter(([, value]) => value !== undefined && value !== null && value !== "")
+    .map(([name]) => name);
 }
 
 function buildMetabaseQueryBody(params?: Record<string, unknown>, assetParameters: AssetParameter[] = []) {
@@ -312,13 +431,97 @@ function readDashboardCards(dashboard: Record<string, unknown>) {
     const card = getObject(dashcard.card);
     const cardId = getNumber(dashcard.card_id) ?? getNumber(card?.id);
     if (cardId === undefined) return [];
+    const dashcardId = getNumber(dashcard.id) ?? getNumber(dashcard.dashboard_card_id);
+    const title = getString(card?.name) ?? getString(dashcard.title) ?? `Metabase card ${cardId}`;
     return [
       {
         cardId: String(cardId),
-        title: getString(card?.name) ?? getString(dashcard.title) ?? `Metabase card ${cardId}`
+        dashcardId: dashcardId === undefined ? undefined : String(dashcardId),
+        title,
+        parameterMappings: readDashcardParameterMappings(dashcard, String(cardId), title)
       }
     ];
   });
+}
+
+function readDashboardParameters(
+  dashboard: Record<string, unknown>,
+  fallbackParameters: AssetParameter[] | undefined
+): AssetParameter[] {
+  const parameters = Array.isArray(dashboard.parameters) ? dashboard.parameters.filter(isObject) : [];
+  const parsed = parameters.flatMap((parameter): AssetParameter[] => {
+    const id = getString(parameter.id) ?? getString(parameter.slug) ?? getString(parameter.name);
+    if (!id) return [];
+    return [{
+      name: id,
+      label: getString(parameter.name) ?? getString(parameter.label) ?? id,
+      type: normalizeMetabaseParameterType(getString(parameter.type)),
+      required: Boolean(parameter.required),
+      defaultValue: parameter.default,
+      platformTarget: parameter.target,
+      raw: pickRaw(parameter, ["id", "slug", "name", "type", "target", "default"])
+    }];
+  });
+  return parsed.length ? dedupeParameters(parsed) : fallbackParameters ?? [];
+}
+
+function readDashcardParameterMappings(
+  dashcard: Record<string, unknown>,
+  cardId: string,
+  cardTitle: string
+): DashboardParameterMapping[] {
+  const dashcardId = getNumber(dashcard.id) ?? getNumber(dashcard.dashboard_card_id);
+  const mappings = Array.isArray(dashcard.parameter_mappings)
+    ? dashcard.parameter_mappings.filter(isObject)
+    : [];
+
+  return mappings.flatMap((mapping): DashboardParameterMapping[] => {
+    const parameterId =
+      getString(mapping.parameter_id) ??
+      getString(mapping.parameterId) ??
+      getString(getObject(mapping.parameter)?.id);
+    if (!parameterId) return [];
+    return [{
+      parameterId,
+      cardId,
+      dashcardId: dashcardId === undefined ? undefined : String(dashcardId),
+      cardTitle,
+      target: mapping.target,
+      parameterType: getString(mapping.parameter_type) ?? getString(mapping.parameterType),
+      raw: pickRaw(mapping, ["parameter_id", "card_id", "target", "parameter_type"])
+    }];
+  });
+}
+
+function normalizeMetabaseParameterType(type: string | undefined): AssetParameter["type"] {
+  const normalized = (type ?? "").toLowerCase();
+  if (normalized.includes("date/range") || normalized.includes("daterange")) return "date_range";
+  if (normalized.includes("date")) return "date";
+  if (normalized.includes("number") || normalized.includes("int") || normalized.includes("float")) return "number";
+  if (normalized.includes("bool")) return "boolean";
+  if (normalized.includes("category") || normalized.includes("dimension") || normalized.includes("field")) return "category";
+  if (normalized.includes("text") || normalized.includes("string")) return "string";
+  return "unknown";
+}
+
+function dedupeParameters(parameters: AssetParameter[]): AssetParameter[] {
+  const byName = new Map<string, AssetParameter>();
+  for (const parameter of parameters) {
+    const existing = byName.get(parameter.name);
+    byName.set(parameter.name, {
+      ...parameter,
+      platformTarget: existing?.platformTarget ?? parameter.platformTarget,
+      raw: {
+        ...(parameter.raw ?? {}),
+        ...(existing?.raw ?? {})
+      }
+    });
+  }
+  return Array.from(byName.values()).sort((left, right) => left.name.localeCompare(right.name));
+}
+
+function pickRaw(value: Record<string, unknown>, keys: string[]): Record<string, unknown> {
+  return Object.fromEntries(keys.map((key) => [key, value[key]]).filter(([, item]) => item !== undefined));
 }
 
 function getAssetNumericId(assetId: string): string {
