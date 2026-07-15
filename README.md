@@ -429,7 +429,7 @@ APP_DATA_REQUIRE_AUTH_TOKEN=true
 http://127.0.0.1:3000/auth/metabase/login
 ```
 
-输入 `https://app-data.luteos.site` 的 Metabase 账号密码。MCP 会调用 Metabase `POST /api/session`，只保存用户 session，不保存密码。
+输入数据平台的账号密码。MCP 会调用 Metabase `POST /api/session` 完成底层权限校验，只保存用户 session，不保存密码。
 
 授权成功后，页面会展示一次个人 MCP token：
 
