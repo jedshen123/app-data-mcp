@@ -509,7 +509,20 @@ DB_USER=superset
 DB_PASSWORD=123456
 DB_NAME=cubecore
 DB_SCHEMA=public
+DB_SSL=false
+DB_SSL_REJECT_UNAUTHORIZED=true
+DB_SSL_CA_FILE=
 ```
+
+Amazon RDS 等要求加密连接的 PostgreSQL 需要设置：
+
+```bash
+DB_SSL=true
+DB_SSL_REJECT_UNAUTHORIZED=true
+DB_SSL_CA_FILE=/path/to/global-bundle.pem
+```
+
+`DB_SSL_CA_FILE` 应指向数据库服务商提供的 CA bundle。仅在临时排障且无法立即安装 CA 时，可以设置 `DB_SSL_REJECT_UNAUTHORIZED=false`；连接仍会加密，但不会验证数据库服务器证书身份，不建议长期使用。
 
 服务首次写入时会自动执行 `create table if not exists`，表名前缀为 `app_data_mcp_`，避免和业务表冲突。已存在的审计表会自动补新增列。审计日志记录：
 

@@ -81,7 +81,10 @@ export function getAuditConfig() {
     password: process.env.DB_PASSWORD,
     database: process.env.DB_NAME,
     schema: process.env.DB_SCHEMA ?? "public",
-    table: process.env.AUDIT_LOG_TABLE ?? "app_data_mcp_audit_logs"
+    table: process.env.AUDIT_LOG_TABLE ?? "app_data_mcp_audit_logs",
+    ssl: readBoolean("DB_SSL", false),
+    sslRejectUnauthorized: readBoolean("DB_SSL_REJECT_UNAUTHORIZED", true),
+    sslCaFile: process.env.DB_SSL_CA_FILE
   };
 }
 

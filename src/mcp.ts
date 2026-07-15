@@ -12,6 +12,7 @@ import { getStoredMetabaseSessionStatus } from "./auth/metabaseSessions.js";
 import { CatalogStore } from "./catalog.js";
 import {
   ACCESS_MODE,
+  getAuditConfig,
   getAuthConfig,
   getDataLimitConfig,
   getMetabaseConfig,
@@ -407,6 +408,7 @@ export function createAppDataMcpServer() {
         const metabase = getMetabaseConfig();
         const posthog = getPostHogConfig();
         const starrocks = getStarRocksConfig();
+        const audit = getAuditConfig();
         const requestContext = getRequestContext();
 
         return toTextPayload({
@@ -417,6 +419,17 @@ export function createAppDataMcpServer() {
           metabaseUserSessionProvided: Boolean(requestContext.metabaseSession),
           metabaseLoginUrl: getMetabaseLoginUrl(),
           dataLimits: limits,
+          audit: {
+            enabled: audit.enabled,
+            dbType: audit.dbType,
+            hostConfigured: Boolean(audit.host),
+            database: audit.database,
+            schema: audit.schema,
+            table: audit.table,
+            ssl: audit.ssl,
+            sslCertificateVerification: audit.ssl && audit.sslRejectUnauthorized,
+            sslCaFileConfigured: Boolean(audit.sslCaFile)
+          },
           allowedOperations: ["search", "read_metadata", "trace_source", "run_readonly_query"],
           deniedOperations: ["create", "update", "delete", "write_back", "save_dashboard", "save_card"],
           metabase:

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import fs from "node:fs";
 import { Pool } from "pg";
 import { getAuditConfig } from "./config.js";
 import { getRequestContext } from "./requestContext.js";
@@ -65,10 +66,10 @@ async function writeAuditLog(input: {
   errorCode?: string;
   errorMessage?: string;
 }) {
-  const client = await getAuditPool();
-  if (!client) return;
-
   try {
+    const client = await getAuditPool();
+    if (!client) return;
+
     await ensureAuditTable(client);
     const config = getAuditConfig();
     const requestContext = getRequestContext();
@@ -136,13 +137,22 @@ async function getAuditPool(): Promise<Pool | undefined> {
     return undefined;
   }
 
-  pool ??= new Pool({
-    host: config.host,
-    port: config.port,
-    user: config.user,
-    password: config.password,
-    database: config.database
-  });
+  if (!pool) {
+    pool = new Pool({
+      host: config.host,
+      port: config.port,
+      user: config.user,
+      password: config.password,
+      database: config.database,
+      ssl: config.ssl
+        ? {
+            rejectUnauthorized: config.sslRejectUnauthorized,
+            ...(config.sslCaFile ? { ca: fs.readFileSync(config.sslCaFile, "utf8") } : {})
+          }
+        : undefined
+    });
+    pool.on("error", (error) => console.error("Unexpected MCP audit pool error:", error));
+  }
   return pool;
 }
 
