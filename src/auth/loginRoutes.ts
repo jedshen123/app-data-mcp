@@ -4,8 +4,7 @@ import { loginMetabaseUser } from "./metabaseSessions.js";
 
 export function registerLoginRoutes(app: Express) {
   app.get("/auth/metabase/login", (_req, res) => {
-    const { metabaseSessionTtlHours } = getAuthConfig();
-    res.type("html").send(renderLoginPage({ metabaseSessionTtlHours }));
+    res.type("html").send(renderLoginPage());
   });
 
   app.post("/auth/metabase/login", async (req, res) => {
@@ -39,7 +38,7 @@ export function getMetabaseLoginUrl(): string {
   return `http://${displayHost}:${port}/auth/metabase/login`;
 }
 
-function renderLoginPage(input: { metabaseSessionTtlHours: number }) {
+function renderLoginPage() {
   return `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -68,12 +67,12 @@ function renderLoginPage(input: { metabaseSessionTtlHours: number }) {
     <input id="password" name="password" type="password" autocomplete="current-password" required />
     <button type="submit">授权</button>
   </form>
-  <p class="hint">不会保存你的密码；仅保存登录会话和个人 MCP token 的哈希。默认有效期 ${input.metabaseSessionTtlHours} 小时。</p>
+  <p class="hint">不会保存你的密码；个人 MCP token 不按时间失效。同一账号重新授权后，之前的 token 将立即失效。</p>
 </body>
 </html>`;
 }
 
-function renderSuccessPage(input: { user: string; expiresAt: string; mcpToken: string }) {
+function renderSuccessPage(input: { user: string; mcpToken: string }) {
   const authorizationHeader = `Authorization: Bearer ${input.mcpToken}`;
   return `<!doctype html>
 <html lang="zh-CN">
@@ -93,7 +92,7 @@ function renderSuccessPage(input: { user: string; expiresAt: string; mcpToken: s
 </head>
 <body>
   <h1>授权成功</h1>
-  <p>已为 ${escapeHtml(input.user)} 保存数据平台登录会话，有效期至 ${escapeHtml(input.expiresAt)}。请把下面的个人 MCP token 配到你的 AI 助手中；token 只展示这一次。</p>
+  <p>已为 ${escapeHtml(input.user)} 保存数据平台登录会话。本次生成的个人 MCP token 不按时间失效，该账号之前的 token 已失效。请把下面的新 token 配到你的 AI 助手中；token 只展示这一次。</p>
   <div class="token-row">
     <code id="token">${escapeHtml(authorizationHeader)}</code>
     <button type="button" id="copy-token">复制</button>

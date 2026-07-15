@@ -7,7 +7,9 @@ import { fetchJson, joinUrl } from "../sync/http.js";
 type StoredMetabaseSession = {
   user: string;
   session: string;
+  /** Legacy single-token field. Kept so previously issued tokens remain valid. */
   mcpTokenHash?: string;
+  mcpTokenHashes?: string[];
   createdAt: string;
   expiresAt: string;
 };
@@ -45,7 +47,7 @@ export async function loginMetabaseUser(username: string, password: string): Pro
   const stored: StoredMetabaseSession = {
     user: username,
     session: session.id,
-    mcpTokenHash: hashMcpToken(mcpToken),
+    mcpTokenHashes: [hashMcpToken(mcpToken)],
     createdAt: now.toISOString(),
     expiresAt: expiresAt.toISOString()
   };
@@ -63,9 +65,7 @@ export async function getUserForMcpToken(token: string | undefined): Promise<str
   const tokenHash = hashMcpToken(token);
   const file = await readSessionFile();
   for (const entry of Object.values(file.sessions)) {
-    if (!entry.mcpTokenHash || entry.mcpTokenHash !== tokenHash) continue;
-    if (new Date(entry.expiresAt).getTime() <= Date.now()) return undefined;
-    return entry.user;
+    if (getStoredTokenHashes(entry).includes(tokenHash)) return entry.user;
   }
   return undefined;
 }
@@ -136,12 +136,12 @@ async function readSessionFile(): Promise<SessionFile> {
     const raw = await fs.readFile(filePath, "utf8");
     const parsed = JSON.parse(raw) as Partial<SessionFile>;
     return {
-      version: parsed.version ?? 1,
+      version: 2,
       sessions: parsed.sessions ?? {}
     };
   } catch (error) {
     if (isNodeError(error) && error.code === "ENOENT") {
-      return { version: 1, sessions: {} };
+      return { version: 2, sessions: {} };
     }
     throw error;
   }
@@ -161,6 +161,10 @@ function createMcpToken(): string {
 
 function hashMcpToken(token: string): string {
   return createHash("sha256").update(token).digest("hex");
+}
+
+function getStoredTokenHashes(entry: StoredMetabaseSession): string[] {
+  return [...new Set([entry.mcpTokenHash, ...(entry.mcpTokenHashes ?? [])].filter(Boolean) as string[])];
 }
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {

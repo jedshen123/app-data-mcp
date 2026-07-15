@@ -431,13 +431,15 @@ http://127.0.0.1:3000/auth/metabase/login
 
 输入数据平台的账号密码。MCP 会调用 Metabase `POST /api/session` 完成底层权限校验，只保存用户 session，不保存密码。
 
-授权成功后，页面会展示一次个人 MCP token：
+`METABASE_SESSION_TTL_HOURS` 只控制底层数据平台登录会话的本地有效期，不控制个人 MCP token。
+
+授权成功后，页面会展示一次不按时间失效的个人 MCP token：
 
 ```text
 Authorization: Bearer appdata_xxx
 ```
 
-服务端只保存这个 token 的哈希，并用 token 反查真实用户邮箱，再使用该用户的 Metabase session 查询数据。这样其他人即使知道某个同事邮箱，也不能冒用他的权限。
+服务端只保存 token 的哈希，并用 token 反查真实用户邮箱，再使用该用户的 Metabase session 查询数据。个人 MCP token 不按时间失效；同一账号重新授权时会轮换 token，只保留本次新 token，之前签发的所有 token 立即失效。这样其他人即使知道某个同事邮箱，也不能冒用他的权限。
 
 如果没有有效的个人 MCP token，数据类 tools 会直接返回 `auth_required`，不会搜索资产或执行查询。允许匿名使用时可以设置：
 
