@@ -131,6 +131,32 @@ export function getPostHogConfig() {
   };
 }
 
+export function getStarRocksConfig() {
+  const host = process.env.STARROCKS_HOST;
+  const user = process.env.STARROCKS_USER;
+  const database = process.env.STARROCKS_DATABASE;
+
+  return {
+    configured: Boolean(host && user && database),
+    host,
+    port: readPositiveInt("STARROCKS_PORT", 9030),
+    user,
+    password: process.env.STARROCKS_PASSWORD,
+    database,
+    connectionLimit: readPositiveInt("STARROCKS_CONNECTION_LIMIT", 10),
+    connectTimeoutMs: readPositiveInt("STARROCKS_CONNECT_TIMEOUT_MS", 10_000),
+    queryTimeoutMs: readPositiveInt("STARROCKS_QUERY_TIMEOUT_MS", 30_000),
+    maxSqlLength: readPositiveInt("STARROCKS_MAX_SQL_LENGTH", 50_000),
+    ssl: readBoolean("STARROCKS_SSL", false),
+    sslRejectUnauthorized: readBoolean("STARROCKS_SSL_REJECT_UNAUTHORIZED", true),
+    missing: [
+      !host ? "STARROCKS_HOST" : undefined,
+      !user ? "STARROCKS_USER" : undefined,
+      !database ? "STARROCKS_DATABASE" : undefined
+    ].filter((value): value is string => Boolean(value))
+  };
+}
+
 function readPositiveInt(name: string, fallback: number): number {
   const raw = process.env[name];
   if (!raw) return fallback;

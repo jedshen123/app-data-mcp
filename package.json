@@ -13,6 +13,7 @@
     "sync:metabase": "tsx src/sync/metabase.ts",
     "sync:posthog": "tsx src/sync/posthog.ts",
     "sync:all": "npm run sync:metabase && npm run sync:posthog",
+    "test:starrocks": "npm run build && node --test dist/connectors/starrocks.test.js",
     "start": "node dist/server.js",
     "start:http": "node dist/http.js",
     "check": "tsc --noEmit -p tsconfig.json"
@@ -22,6 +23,7 @@
     "@types/pg": "^8.20.0",
     "dotenv": "^17.2.3",
     "express": "^5.2.1",
+    "mysql2": "^3.23.0",
     "pg": "^8.22.0",
     "zod": "^3.25.76"
   },

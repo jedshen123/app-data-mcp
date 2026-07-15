@@ -17,9 +17,11 @@ import {
   getMetabaseConfig,
   getMetabasePublicUrl,
   getPostHogConfig,
+  getStarRocksConfig,
   getSyncFreshnessConfig
 } from "./config.js";
 import { runLiveAsset } from "./connectors/runAsset.js";
+import { runStarRocksQuery } from "./connectors/starrocks.js";
 import { assetNotFound, summarizeAsset, toLimitedTextPayload, toTextPayload } from "./format.js";
 import { getRequestContext } from "./requestContext.js";
 
@@ -32,7 +34,7 @@ export function createAppDataMcpServer() {
     version: "0.1.0"
   }, {
     instructions:
-      "This server is a read-only internal data gateway. Before running live Metabase data tools, call auth_status. If metabase.authorized is false, ask the user to open loginUrl and configure the personal MCP token as Authorization: Bearer <token>. Never ask for passwords in chat."
+      "This server is a read-only internal data gateway. Prefer search_assets and run_asset for curated Metabase/PostHog data. Use query_starrocks only when curated assets do not answer the question or the user explicitly asks for SQL. Before querying unfamiliar StarRocks tables, inspect metadata with SHOW/DESCRIBE, then generate a bounded SELECT. Before running live Metabase data tools, call auth_status. If metabase.authorized is false, ask the user to open loginUrl and configure the personal MCP token as Authorization: Bearer <token>. Never ask for passwords in chat."
   });
 
   server.tool(
@@ -267,6 +269,55 @@ export function createAppDataMcpServer() {
     }
   );
 
+  server.tool(
+    "query_starrocks",
+    "Execute one read-only SQL query against StarRocks. Use SHOW/DESCRIBE to inspect unfamiliar schemas, then SELECT/WITH for data. DDL, DML, multi-statement SQL, file reads, and long-running helper functions are rejected. Prefer curated run_asset results when available.",
+    {
+      sql: z
+        .string()
+        .min(1)
+        .max(getStarRocksConfig().maxSqlLength)
+        .describe("One StarRocks read-only SQL statement: SELECT, WITH...SELECT, SHOW, DESCRIBE/DESC, or EXPLAIN."),
+      limit: z.number().int().min(1).max(limits.maxResultRowLimit).default(limits.defaultResultRowLimit)
+    },
+    async ({ sql, limit }) => {
+      const auditDetails: AuditDetails = {
+        query: sql,
+        limit,
+        assetPlatform: "starrocks",
+        assetType: "adhoc_sql",
+        metadata: { database: getStarRocksConfig().database }
+      };
+      return auditToolCall("query_starrocks", auditDetails, async () => {
+        const authError = requireUserToken();
+        if (authError) return authError;
+
+        try {
+          const data = await runStarRocksQuery(sql, limit);
+          return toLimitedTextPayload({
+            data,
+            source: {
+              platform: "starrocks",
+              database: data.database
+            },
+            warnings: data.truncated ? [`Result truncated to ${limit} rows.`] : []
+          }, limits.maxResponseBytes);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          const errorCode = message.includes(":") ? message.slice(0, message.indexOf(":")) : "starrocks_query_failed";
+          return toTextPayload({
+            error: errorCode,
+            message,
+            source: {
+              platform: "starrocks",
+              database: getStarRocksConfig().database
+            }
+          });
+        }
+      });
+    }
+  );
+
   server.tool("list_domains", "List business domains found in the local metadata config.", {}, async () => {
     return auditToolCall("list_domains", {}, async () => {
       const authError = requireUserToken();
@@ -349,12 +400,13 @@ export function createAppDataMcpServer() {
 
   server.tool(
     "connector_status",
-    "Show whether Metabase and PostHog connector environment variables are configured. Secrets are never returned.",
+    "Show whether Metabase, PostHog, and StarRocks connector environment variables are configured. Secrets are never returned.",
     {},
     async () => {
       return auditToolCall("connector_status", {}, async () => {
         const metabase = getMetabaseConfig();
         const posthog = getPostHogConfig();
+        const starrocks = getStarRocksConfig();
         const requestContext = getRequestContext();
 
         return toTextPayload({
@@ -387,6 +439,16 @@ export function createAppDataMcpServer() {
             baseUrlConfigured: Boolean(posthog.baseUrl),
             projectIdConfigured: Boolean(posthog.projectId),
             personalApiKeyConfigured: Boolean(posthog.personalApiKey)
+          },
+          starrocks: {
+            configured: starrocks.configured,
+            hostConfigured: Boolean(starrocks.host),
+            port: starrocks.port,
+            userConfigured: Boolean(starrocks.user),
+            database: starrocks.database,
+            ssl: starrocks.ssl,
+            queryTimeoutMs: starrocks.queryTimeoutMs,
+            missing: starrocks.missing
           }
         });
       });

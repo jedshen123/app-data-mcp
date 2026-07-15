@@ -8,6 +8,7 @@
 - `get_asset`: 查看单个资产完整元信息。
 - `trace_asset`: 查看资产的 SQL / 事件 / 上游表 / 原始链接。
 - `run_asset`: 只读返回支持资产的真实数据；不支持时读取本地 `sampleData` 兜底。
+- `query_starrocks`: 执行 AI 生成的单条 StarRocks 只读 SQL，支持先查看表结构再查询数据。
 - `list_domains`: 查看配置里已有的业务域。
 - `auth_status`: 查看当前请求用户和 Metabase 授权状态。
 - `catalog_status`: 查看本地元信息配置是否已初始化、资产数量和分类统计。
@@ -23,6 +24,7 @@
 - 读取看板、卡片、insight、指标口径和来源链接。
 - 追踪上游表、事件、SQL、原平台 URL。
 - 执行 Metabase/PostHog 查询时，只允许调用读取类 API，并限制为只读查询结果。
+- 执行 StarRocks 查询时，只允许单条 `SELECT`、`WITH ... SELECT`、`SHOW`、`DESCRIBE/DESC` 或 `EXPLAIN`。
 
 禁止的操作：
 
@@ -40,6 +42,7 @@
 - `search_assets` 默认返回 10 条，最多 50 条。
 - `run_asset` 默认返回 100 行，最多 500 行。
 - 单次 MCP 响应默认最大约 1 MB，超过会返回 `response_too_large`，提示缩小查询范围。
+- `query_starrocks` 与 `run_asset` 共用行数上限；同时在 StarRocks 会话设置 `sql_select_limit` 和 `query_timeout`。
 
 可以通过环境变量调整，但建议生产环境保持保守：
 
@@ -157,6 +160,51 @@ PostHog insight 支持常见只读覆盖参数：
   }
 }
 ```
+
+## StarRocks 自助 SQL
+
+`query_starrocks` 用于 AI 助手生成 SQL 后查询数仓。推荐让 AI 按下面的顺序工作：
+
+1. 优先调用 `search_assets`，能由已有 Metabase/PostHog 看板或卡片回答时使用 `run_asset`。
+2. 没有现成资产、用户明确要求 SQL 或需要自定义维度时，再使用 `query_starrocks`。
+3. 不熟悉表结构时，先执行 `SHOW TABLES`、`DESCRIBE table_name` 或 `SHOW CREATE TABLE table_name`。
+4. 根据真实字段生成带明确日期范围和过滤条件的 `SELECT`，避免扫描无关数据。
+
+示例：
+
+```json
+{
+  "sql": "SELECT dt, count(*) AS active_users FROM ads_app_daily WHERE dt >= '2026-07-01' GROUP BY dt ORDER BY dt",
+  "limit": 100
+}
+```
+
+服务会拒绝 DDL、DML、多语句、`INTO OUTFILE`、`LOAD_FILE`、`FILES`、`SLEEP`、可执行注释和自定义查询 Hint 等危险或消耗型 SQL。每次执行还会设置 StarRocks 当前会话的查询超时与最大返回行数，并继续受 MCP 响应字节数限制。
+
+StarRocks 配置放在 `.env`，不要写入 `config/assets.json`：
+
+```bash
+STARROCKS_HOST=127.0.0.1
+STARROCKS_PORT=9030
+STARROCKS_USER=app_data_mcp_reader
+STARROCKS_PASSWORD=your-password
+STARROCKS_DATABASE=your_database
+STARROCKS_CONNECTION_LIMIT=10
+STARROCKS_CONNECT_TIMEOUT_MS=10000
+STARROCKS_QUERY_TIMEOUT_MS=30000
+STARROCKS_MAX_SQL_LENGTH=50000
+STARROCKS_SSL=false
+```
+
+必须使用专用只读账号。MCP token 负责识别和审计查询人，真正的数据表权限由这个 StarRocks 账号控制。管理员可以按实际数据库创建最小权限账号，例如：
+
+```sql
+CREATE USER 'app_data_mcp_reader' IDENTIFIED BY 'replace-with-a-strong-password';
+GRANT SELECT ON ALL TABLES IN DATABASE your_database TO USER 'app_data_mcp_reader';
+GRANT SELECT ON ALL VIEWS IN DATABASE your_database TO USER 'app_data_mcp_reader';
+```
+
+不要给该账号授予 `INSERT`、`UPDATE`、`DELETE`、`CREATE`、`DROP`、`ALTER`、`EXPORT` 或管理角色。配置后可先调用 `connector_status` 确认 `starrocks.configured=true`，再让 AI 执行 `SHOW TABLES` 验证连接。
 
 ## 本地运行
 
@@ -465,6 +513,7 @@ DB_SCHEMA=public
 
 - 用户邮箱、鉴权方式、AI 助手平台、request id、IP、user agent。
 - tool 名称、asset id、平台、资产类型、搜索词、limit。
+- 对 `query_starrocks` 记录 SQL 文本、默认数据库和 SQL limit，便于追责与排障。
 - 参数哈希，不记录完整参数明文。
 - 返回行数、返回字节数、耗时、状态、错误摘要。
 
