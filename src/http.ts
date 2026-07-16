@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
 import express from "express";
+import { registerAdminRoutes } from "./admin/adminRoutes.js";
 import { registerLoginRoutes } from "./auth/loginRoutes.js";
 import { getUserForMcpToken } from "./auth/metabaseSessions.js";
 import { getHttpConfig } from "./config.js";
@@ -12,8 +13,10 @@ import { withRequestContext } from "./requestContext.js";
 const { host, port, bearerToken, allowedHosts } = getHttpConfig();
 
 const app = createMcpExpressApp({ host, allowedHosts });
+app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: false }));
 registerLoginRoutes(app);
+registerAdminRoutes(app);
 
 app.get("/health", (_req, res) => {
   res.json({
@@ -61,7 +64,7 @@ app.use("/mcp", async (req, res, next) => {
 });
 
 app.post("/mcp", async (req, res) => {
-  const server = createAppDataMcpServer();
+  const server = await createAppDataMcpServer();
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true

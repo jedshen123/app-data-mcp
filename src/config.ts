@@ -26,10 +26,6 @@ export type MetabaseAuthConfig =
       missing: string[];
     };
 
-export function getAssetFilePath(): string {
-  return process.env.DATA_ASSETS_FILE ?? "config/assets.json";
-}
-
 export function getHttpConfig() {
   return {
     host: process.env.MCP_HTTP_HOST ?? "127.0.0.1",
@@ -49,6 +45,8 @@ export function getAuthConfig() {
     metabaseAuthMode: process.env.METABASE_AUTH_MODE ?? "service-fallback",
     allowServiceFallback: readBoolean("METABASE_ALLOW_SERVICE_FALLBACK", true),
     metabaseSessionTtlHours: readPositiveInt("METABASE_SESSION_TTL_HOURS", 168),
+    adminSessionTtlHours: readPositiveInt("ADMIN_SESSION_TTL_HOURS", 168),
+    adminSessionTable: process.env.ADMIN_SESSION_TABLE ?? "app_data_mcp_admin_sessions",
     requireUserHeader: readBoolean("APP_DATA_REQUIRE_AUTH_TOKEN", readBoolean("APP_DATA_REQUIRE_USER_HEADER", true))
   };
 }
@@ -85,6 +83,31 @@ export function getAuditConfig() {
     ssl: readBoolean("DB_SSL", false),
     sslRejectUnauthorized: readBoolean("DB_SSL_REJECT_UNAUTHORIZED", true),
     sslCaFile: process.env.DB_SSL_CA_FILE
+  };
+}
+
+export function getMetadataConfig() {
+  return {
+    dbType: process.env.DB_TYPE,
+    host: process.env.DB_HOST,
+    port: readPositiveInt("DB_PORT", 5432),
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_NAME,
+    schema: process.env.DB_SCHEMA ?? "public",
+    table: process.env.METADATA_TABLE ?? "app_data_mcp_assets",
+    defaultPublished: readBoolean("METADATA_DEFAULT_PUBLISHED", false),
+    ssl: readBoolean("DB_SSL", false),
+    sslRejectUnauthorized: readBoolean("DB_SSL_REJECT_UNAUTHORIZED", true),
+    sslCaFile: process.env.DB_SSL_CA_FILE
+  };
+}
+
+export function getToolManagementConfig() {
+  return {
+    schema: process.env.DB_SCHEMA ?? "public",
+    table: process.env.MCP_TOOLS_TABLE ?? "app_data_mcp_tools",
+    settingsTable: process.env.MCP_SETTINGS_TABLE ?? "app_data_mcp_settings"
   };
 }
 

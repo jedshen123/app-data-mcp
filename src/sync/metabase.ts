@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { getMetabaseConfig, getMetabasePublicUrl, getSyncFreshnessConfig } from "../config.js";
+import { upsertPlatformAssets } from "../metadataStore.js";
 import type {
   AssetParameter,
   ColumnMeta,
@@ -7,7 +8,6 @@ import type {
   DataAccessSnapshot,
   DataAsset
 } from "../types.js";
-import { replacePlatformAssets } from "./catalogFile.js";
 import { asArray, fetchJson, getNumber, getObject, getString, joinUrl } from "./http.js";
 
 type MetabaseClient = {
@@ -33,7 +33,7 @@ if (config.mode === "missing") {
 try {
   const client = await createMetabaseClient(config);
   const assets = await syncMetabaseAssets(client);
-  const catalog = await replacePlatformAssets("metabase", assets);
+  const result = await upsertPlatformAssets("metabase", assets);
   const stats: SyncStats = {
     dashboards: assets.filter((asset) => asset.type === "dashboard").length,
     cards: assets.filter((asset) => asset.type === "card").length,
@@ -42,7 +42,7 @@ try {
   };
 
   console.log(
-    `Synced Metabase metadata: ${stats.dashboards} dashboards, ${stats.cards} cards, ${stats.accessSnapshots} access snapshots. Catalog now has ${catalog.assets.length} assets.`
+    `Synced Metabase metadata to PostgreSQL: ${stats.dashboards} dashboards, ${stats.cards} cards, ${stats.accessSnapshots} access snapshots, ${result.synced} upserted.`
   );
 } catch (error) {
   console.error("Failed to sync Metabase metadata:", error);

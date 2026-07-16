@@ -1,7 +1,6 @@
-import fs from "node:fs/promises";
-import path from "node:path";
 import { z } from "zod";
-import { getAssetFilePath, getDataLimitConfig, getMetabasePublicUrl } from "./config.js";
+import { getDataLimitConfig, getMetabasePublicUrl, getMetadataConfig } from "./config.js";
+import { readPublishedCatalog } from "./metadataStore.js";
 import type { AssetCatalog, DataAsset, DataAssetType, DataPlatform } from "./types.js";
 
 const columnSchema = z.object({
@@ -103,39 +102,22 @@ export type SearchAssetsInput = {
 };
 
 export class CatalogStore {
-  private catalog: AssetCatalog | null = null;
-
-  constructor(private readonly filePath: string) {}
-
   static fromEnv(): CatalogStore {
-    const configuredPath = getAssetFilePath();
-    return new CatalogStore(path.resolve(process.cwd(), configuredPath));
+    return new CatalogStore();
   }
 
   get path(): string {
-    return this.filePath;
+    const config = getMetadataConfig();
+    return `${config.schema}.${config.table}`;
   }
 
   async load(): Promise<AssetCatalog> {
-    let raw: string;
-    try {
-      raw = await fs.readFile(this.filePath, "utf8");
-    } catch (error) {
-      if (isNodeError(error) && error.code === "ENOENT") {
-        throw new Error(
-          `Asset catalog is not initialized: ${this.filePath}. Run "npm run init:assets" first.`
-        );
-      }
-      throw error;
-    }
-
-    const parsed = catalogSchema.parse(JSON.parse(raw));
-    this.catalog = rewriteCatalogPublicUrls(parsed);
-    return this.catalog;
+    const parsed = catalogSchema.parse(await readPublishedCatalog());
+    return rewriteCatalogPublicUrls(parsed);
   }
 
   async getCatalog(): Promise<AssetCatalog> {
-    return this.catalog ?? this.load();
+    return this.load();
   }
 
   async findById(id: string): Promise<DataAsset | undefined> {
@@ -158,7 +140,7 @@ export class CatalogStore {
 
       return {
         initialized: true,
-        path: this.filePath,
+        path: this.path,
         version: catalog.version,
         updatedAt: catalog.updatedAt,
         assetCount: catalog.assets.length,
@@ -168,7 +150,7 @@ export class CatalogStore {
     } catch (error) {
       return {
         initialized: false,
-        path: this.filePath,
+        path: this.path,
         error: error instanceof Error ? error.message : String(error),
         assetCount: 0,
         byPlatform: {},
@@ -225,10 +207,6 @@ function countBy<T>(items: T[], getKey: (item: T) => string): Record<string, num
     counts[key] = (counts[key] ?? 0) + 1;
     return counts;
   }, {});
-}
-
-function isNodeError(error: unknown): error is NodeJS.ErrnoException {
-  return error instanceof Error && "code" in error;
 }
 
 function normalize(value: string | undefined): string {

@@ -1,6 +1,6 @@
 # App Data MCP
 
-这是一个面向内部数据平台的 MCP 服务 MVP。当前版本先把 Metabase、PostHog、指标等元信息同步到本地配置文件，让 Codex、Claude Code 等 AI 客户端可以先完成资产发现、详情查看、数据出处追踪和样例取数。
+这是一个面向内部数据平台的 MCP 服务。Metabase、PostHog 等元信息同步到 PostgreSQL，由管理员在后台决定是否对 MCP 用户开放，让 Codex、Claude Code 等 AI 客户端完成资产发现、详情查看、数据出处追踪和受控取数。
 
 ## 当前能力
 
@@ -11,7 +11,7 @@
 - `query_starrocks`: 执行 AI 生成的单条 StarRocks 只读 SQL，支持先查看表结构再查询数据。
 - `list_domains`: 查看配置里已有的业务域。
 - `auth_status`: 查看当前请求用户和 Metabase 授权状态。
-- `catalog_status`: 查看本地元信息配置是否已初始化、资产数量和分类统计。
+- `catalog_status`: 查看 PostgreSQL 中已开放元信息的数量和分类统计。
 - `connector_status`: 查看连接器配置状态和只读访问策略。
 
 ## 只读访问策略
@@ -20,7 +20,7 @@
 
 允许的操作：
 
-- 搜索和读取本地元信息。
+- 搜索和读取 PostgreSQL 中已开放的元信息。
 - 读取看板、卡片、insight、指标口径和来源链接。
 - 追踪上游表、事件、SQL、原平台 URL。
 - 执行 Metabase/PostHog 查询时，只允许调用读取类 API，并限制为只读查询结果。
@@ -181,7 +181,7 @@ PostHog insight 支持常见只读覆盖参数：
 
 服务会拒绝 DDL、DML、多语句、`INTO OUTFILE`、`LOAD_FILE`、`FILES`、`SLEEP`、可执行注释和自定义查询 Hint 等危险或消耗型 SQL。每次执行还会设置 StarRocks 当前会话的查询超时与最大返回行数，并继续受 MCP 响应字节数限制。
 
-StarRocks 配置放在 `.env`，不要写入 `config/assets.json`：
+StarRocks 配置放在 `.env`，不要写入元信息表：
 
 ```bash
 STARROCKS_HOST=127.0.0.1
@@ -208,17 +208,7 @@ GRANT SELECT ON ALL VIEWS IN DATABASE your_database TO USER 'app_data_mcp_reader
 
 ## 本地运行
 
-第一次部署先初始化本地元信息配置：
-
-```bash
-npm run init:assets
-```
-
-这会创建空的 `config/assets.json`。如果文件已经存在，不会覆盖。需要强制重置为空文件时：
-
-```bash
-npm run init:assets:force
-```
+第一次部署先配置 PostgreSQL。服务或同步脚本首次访问时会自动创建 `DB_SCHEMA.METADATA_TABLE`，默认是 `public.app_data_mcp_assets`。
 
 stdio 模式，适合本机 Codex / Claude Code 通过命令启动：
 
@@ -245,17 +235,11 @@ http://127.0.0.1:3000/mcp
 http://127.0.0.1:3000/health
 ```
 
-默认读取 `config/assets.json`。也可以通过环境变量指定：
-
-```bash
-DATA_ASSETS_FILE=/path/to/assets.json npm run dev
-```
-
-如果还没有从 Metabase/PostHog 同步到任何资产，MCP 仍然可以启动；`catalog_status` 会显示 `assetCount: 0`，`search_assets` 会返回空列表。此时需要先手工往 `config/assets.json` 填元信息，或后续运行平台同步脚本。
+如果还没有同步并开放任何资产，`catalog_status` 会显示 `assetCount: 0`，`search_assets` 会返回空列表。先运行同步脚本，再打开 `http://127.0.0.1:3000/admin` 使用 Metabase 管理员账号登录并勾选开放。
 
 ## 同步平台元信息
 
-初始化配置文件后，可以运行只读同步脚本，把 Metabase/PostHog 元信息写入本地 `config/assets.json`。
+可以运行只读同步脚本，把 Metabase/PostHog 元信息 upsert 到 PostgreSQL。
 
 同步 Metabase：
 
@@ -275,20 +259,20 @@ npm run sync:posthog
 npm run sync:all
 ```
 
-同步脚本只读取平台 API，然后更新本地配置文件：
+同步脚本只读取平台 API，然后更新元信息表：
 
-- `sync:metabase` 只替换 `platform: "metabase"` 的资产。
-- `sync:posthog` 只替换 `platform: "posthog"` 的资产。
-- `platform: "local"` 的本地指标口径会保留。
+- 已存在的资产更新 `metadata` 和同步时间，不覆盖管理员设置的 `is_published` 和人工配置。
+- 新资产默认 `is_published=false`；可通过 `METADATA_DEFAULT_PUBLISHED=true` 调整，但生产环境不建议。
+- 平台中已经消失的资产会标记为 inactive，不再对 MCP 暴露。
 - 不会创建、更新、删除 Metabase/PostHog 平台内的任何对象。
 
-Metabase 同步会为 dashboard/card 写入本地权限快照 `asset.access`，包括 collection、creator、archived、personal collection、同步时间等。MCP 使用两级过滤：
+Metabase 同步会为 dashboard/card 写入权限快照 `asset.access`，包括 collection、creator、archived、personal collection、同步时间等。MCP 使用两级过滤：
 
 - `search_assets` / `list_domains`: 用本地权限快照快速过滤归档资产和非本人 personal collection。
 - `get_asset` / `trace_asset`: 先做本地快照过滤，再用当前用户 Metabase session 实时请求 `GET /api/card/:id` 或 `GET /api/dashboard/:id` 校验可见性。
 - `run_asset`: 继续使用用户 Metabase session 执行只读查询，保留平台实时权限判断。
 
-升级到权限快照版本后，已有 `config/assets.json` 里的旧 Metabase 资产不会自动拥有 `asset.access`，需要重新执行一次：
+部署或升级后执行一次完整同步：
 
 ```bash
 npm run sync:metabase
@@ -343,10 +327,7 @@ stdio：
     "app-data": {
       "command": "npm",
       "args": ["run", "dev"],
-      "cwd": "/Users/lute/code/app-data-mcp",
-      "env": {
-        "DATA_ASSETS_FILE": "config/assets.json"
-      }
+      "cwd": "/Users/lute/code/app-data-mcp"
     }
   }
 }
@@ -371,7 +352,7 @@ HTTP / Streamable HTTP：
 
 ## Metabase / PostHog API 配置
 
-不要把 API key、用户名、密码写进 `config/assets.json`。元信息 JSON 只放可给 AI 使用的资产描述、链接、字段、血缘和样例数据。
+不要把 API key、用户名、密码写入元信息表。密钥只通过部署环境变量提供。
 
 复制 `.env.example` 为 `.env`，在部署环境里填写：
 
@@ -394,7 +375,7 @@ METABASE_BASE_URL=http://127.0.0.1:3000
 METABASE_PUBLIC_URL=http://54.226.190.74:3000
 ```
 
-这样 MCP 查询仍走服务器本地 API，但返回的 `asset.url` / `source.url` 会是远程可访问地址。修改后建议重新运行 `npm run sync:metabase`；即使暂时不重同步，服务启动时也会按 `METABASE_PUBLIC_URL` 重写本地 catalog 里的 Metabase 来源链接。
+这样 MCP 查询仍走服务器本地 API，但返回的 `asset.url` / `source.url` 会是远程可访问地址。修改后建议重新运行 `npm run sync:metabase`；即使暂时不重同步，服务读取时也会按 `METABASE_PUBLIC_URL` 重写 Metabase 来源链接。
 
 如果没有拿到 `METABASE_API_KEY`，可以用 Metabase 用户名密码：
 
@@ -582,9 +563,36 @@ POSTHOG_PERSONAL_API_KEY=phx_...
 - `posthog:insight:activation-funnel`
 - `metric:activation_rate`
 
-## 元信息配置
+## 后台管理与元信息配置
 
-核心配置在 `config/assets.json`：
+HTTP 服务启动后访问：
+
+```text
+http://127.0.0.1:3000/admin
+```
+
+后台使用 Metabase 账号登录，并通过 `/api/user/current` 校验 `is_superuser=true`。管理员可以：
+
+- 在 Metabase、PostHog 导航中查看同步状态和元信息。
+- 勾选或取消 `is_published`，也可以选择多条后批量开放或关闭；变更会立即影响 MCP 搜索和读取。
+- 点击列表字段标题可按开放状态、标题、类型、业务域、有效状态和同步时间排序。
+- Metabase、PostHog 和审计列表使用固定默认列宽；拖拽表头右侧分隔线可调整列宽，结果保存在当前浏览器。
+- 业务域使用可搜索组合框，支持输入过滤候选项；也可按资产类型和开放状态筛选，并与关键词搜索、排序和分页组合使用。
+- 编辑标题、描述、业务域和标签；人工配置保存在 `admin_overrides`，后续同步不会覆盖。
+- 在详情弹窗查看 URL、SQL/查询定义、字段、参数、Dashboard 映射、血缘、权限快照、警告、样例数据和完整 JSON；同步字段只读。
+- 在审计导航查看 `AUDIT_LOG_TABLE` 中的用户、AI 客户端、tool、资产、状态、行数和耗时。
+- 在 MCP 工具管理导航查看工具名称、分类、风险、详情描述和开放状态；关闭后工具不会出现在新 MCP 连接的 `tools/list` 中。
+- MCP 工具管理页可查看和编辑连接时发送给 AI 的中文全局 `instructions`，并在工具详情中查看调用时机和参数说明；工具标识和参数名保留英文，确保客户端能准确调用。
+- 实际发送给 AI 的说明会自动附加当前未开放工具清单；`query_starrocks` 关闭时会明确要求 AI 提示“SQL 查询工具未开放”，并与“StarRocks 连接器未配置”区分。
+
+管理员登录会话持久化到 PostgreSQL 的 `app_data_mcp_admin_sessions` 表。浏览器 Cookie 只保存随机令牌，数据库只保存令牌哈希；服务重启后在有效期内无需重新登录。默认有效期为 168 小时，可配置：
+
+```bash
+ADMIN_SESSION_TTL_HOURS=168
+ADMIN_SESSION_TABLE=app_data_mcp_admin_sessions
+```
+
+元信息表默认名为 `public.app_data_mcp_assets`，主要字段包括 `asset_id`、`platform`、`metadata jsonb`、`admin_overrides jsonb`、`is_published`、`is_active` 和同步时间。`metadata` 内的核心内容包括：
 
 - `title` / `description`: 给 AI 搜索和理解使用。
 - `businessDomain` / `tags`: 用于业务域过滤和召回。
@@ -596,6 +604,8 @@ POSTHOG_PERSONAL_API_KEY=phx_...
 - `sourceRefs`: 上游表、事件、引用资产等血缘信息。
 - `sampleData`: 本地样例数据；live connector 失败或不支持时可作为兜底。
 - `warnings`: 数据延迟、口径注意事项、MVP 限制。
+
+MCP 工具配置默认保存在 `public.app_data_mcp_tools`，全局说明保存在 `public.app_data_mcp_settings`；可以通过 `MCP_TOOLS_TABLE` 和 `MCP_SETTINGS_TABLE` 修改表名。HTTP 模式每次建立 MCP 服务时读取最新开关和说明；stdio 或已经建立的长连接需要重新连接后才会更新。
 
 ## 下一步建议
 

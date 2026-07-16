@@ -16,6 +16,7 @@ import {
   getAuthConfig,
   getDataLimitConfig,
   getMetabaseConfig,
+  getMetadataConfig,
   getMetabasePublicUrl,
   getPostHogConfig,
   getStarRocksConfig,
@@ -25,22 +26,25 @@ import { runLiveAsset } from "./connectors/runAsset.js";
 import { runStarRocksQuery } from "./connectors/starrocks.js";
 import { assetNotFound, summarizeAsset, toLimitedTextPayload, toTextPayload } from "./format.js";
 import { getRequestContext } from "./requestContext.js";
+import { buildEffectiveInstructions, getGlobalInstructions, isManagedToolEnabled, listManagedTools } from "./toolStore.js";
 
-export function createAppDataMcpServer() {
+export async function createAppDataMcpServer() {
   const catalog = CatalogStore.fromEnv();
   const limits = getDataLimitConfig();
+  const [managedTools, globalInstructions] = await Promise.all([listManagedTools(), getGlobalInstructions()]);
+  const enabledTools = new Set(managedTools.filter((tool) => tool.enabled).map((tool) => tool.name));
+  const effectiveInstructions = buildEffectiveInstructions(globalInstructions, managedTools);
 
   const server = new McpServer({
     name: "app-data-mcp",
     version: "0.1.0"
   }, {
-    instructions:
-      "This server is a read-only internal data gateway. Prefer search_assets and run_asset for curated Metabase/PostHog data. Use query_starrocks only when curated assets do not answer the question or the user explicitly asks for SQL. Before querying unfamiliar StarRocks tables, inspect metadata with SHOW/DESCRIBE, then generate a bounded SELECT. Before running live Metabase data tools, call auth_status. If metabase.authorized is false, ask the user to open loginUrl and configure the personal MCP token as Authorization: Bearer <token>. Never ask for passwords in chat."
+    instructions: effectiveInstructions
   });
 
-  server.tool(
+  if (enabledTools.has("search_assets")) server.tool(
     "search_assets",
-    "Search local metadata for Metabase dashboards/cards, PostHog insights, metrics, tables, and events.",
+    "Search published PostgreSQL metadata for Metabase dashboards/cards, PostHog insights, metrics, tables, and events.",
     {
       query: z.string().default("").describe("Keyword query, e.g. 新增用户, activation, retention."),
       platform: z.enum(["metabase", "posthog", "local"]).optional(),
@@ -70,7 +74,7 @@ export function createAppDataMcpServer() {
         return toTextPayload({
           assets: assets.map(summarizeAsset),
           count: assets.length,
-          note: "Results come from local metadata config and are filtered by local access snapshots. Use get_asset, trace_asset, or run_asset with an id for details.",
+          note: "Results come from published PostgreSQL metadata and are filtered by access snapshots. Use get_asset, trace_asset, or run_asset with an id for details.",
           nextSteps: [
             "If a curated Metabase/PostHog asset answers the question, prefer run_asset.",
             "For Metabase dashboards, inspect parameters and dashboardParameterMappings to decide whether filters can answer the user's question.",
@@ -81,7 +85,7 @@ export function createAppDataMcpServer() {
     }
   );
 
-  server.tool(
+  if (enabledTools.has("get_asset")) server.tool(
     "get_asset",
     "Get full metadata for one data asset, including source URL, query text, columns, children, and warnings.",
     {
@@ -106,7 +110,7 @@ export function createAppDataMcpServer() {
     }
   );
 
-  server.tool(
+  if (enabledTools.has("trace_asset")) server.tool(
     "trace_asset",
     "Trace where a data asset comes from, including upstream tables/events/assets and original platform links.",
     {
@@ -148,7 +152,7 @@ export function createAppDataMcpServer() {
     }
   );
 
-  server.tool(
+  if (enabledTools.has("run_asset")) server.tool(
     "run_asset",
     "Return read-only live data for a supported Metabase/PostHog asset, with local sampleData fallback.",
     {
@@ -177,7 +181,7 @@ export function createAppDataMcpServer() {
             error: "asset_access_denied",
             asset_id,
             reason: snapshotDecision.reason,
-            message: "This asset is hidden by the local metadata access snapshot."
+            message: "This asset is hidden by the synchronized metadata access snapshot."
           });
         }
         const paramsError = validateAssetParams(asset, params);
@@ -230,7 +234,7 @@ export function createAppDataMcpServer() {
             live: false,
             error: "asset_not_runnable",
             message:
-              "This asset is not supported by a live connector and does not include sampleData in the local metadata config.",
+              "This asset is not supported by a live connector and does not include sampleData in PostgreSQL metadata.",
             source: {
               url: asset.url,
               queryText: asset.queryText,
@@ -270,7 +274,7 @@ export function createAppDataMcpServer() {
     }
   );
 
-  server.tool(
+  if (enabledTools.has("query_starrocks")) server.tool(
     "query_starrocks",
     "Execute one read-only SQL query against StarRocks. Use SHOW/DESCRIBE to inspect unfamiliar schemas, then SELECT/WITH for data. DDL, DML, multi-statement SQL, file reads, and long-running helper functions are rejected. Prefer curated run_asset results when available.",
     {
@@ -290,6 +294,13 @@ export function createAppDataMcpServer() {
         metadata: { database: getStarRocksConfig().database }
       };
       return auditToolCall("query_starrocks", auditDetails, async () => {
+        if (!await isManagedToolEnabled("query_starrocks")) {
+          return toTextPayload({
+            error: "tool_not_enabled",
+            tool: "query_starrocks",
+            message: "SQL 查询工具 query_starrocks 未开放，当前无法通过此 MCP 直接查询 StarRocks 表数据。请联系 MCP 管理员开放该工具，或改用已开放的 Metabase/PostHog 数据资产。"
+          });
+        }
         const authError = requireUserToken();
         if (authError) return authError;
 
@@ -319,7 +330,7 @@ export function createAppDataMcpServer() {
     }
   );
 
-  server.tool("list_domains", "List business domains found in the local metadata config.", {}, async () => {
+  if (enabledTools.has("list_domains")) server.tool("list_domains", "List business domains found in published PostgreSQL metadata.", {}, async () => {
     return auditToolCall("list_domains", {}, async () => {
       const authError = requireUserToken();
       if (authError) return authError;
@@ -337,9 +348,9 @@ export function createAppDataMcpServer() {
     });
   });
 
-  server.tool(
+  if (enabledTools.has("catalog_status")) server.tool(
     "catalog_status",
-    "Show whether the local asset catalog is initialized and how many assets it contains.",
+    "Show whether the PostgreSQL asset catalog is initialized and how many published assets it contains.",
     {},
     async () => {
       return auditToolCall("catalog_status", {}, async () => {
@@ -352,16 +363,16 @@ export function createAppDataMcpServer() {
             ? status.assetCount > 0
               ? buildCatalogStatusNextSteps(freshness)
               : [
-                  "The catalog is initialized but empty.",
-                  "Add assets to config/assets.json or run a future sync script for Metabase/PostHog."
+                  "The published catalog is empty.",
+                  "Run a Metabase/PostHog sync, then publish assets from the /admin management page."
                 ]
-            : ['Run "npm run init:assets" in the MCP project directory.']
+            : ["Check PostgreSQL DB_* configuration and database permissions."]
         });
       });
     }
   );
 
-  server.tool(
+  if (enabledTools.has("auth_status")) server.tool(
     "auth_status",
     "Check the current MCP request user and Metabase authorization status. Call this before run_asset for Metabase assets.",
     {},
@@ -399,7 +410,7 @@ export function createAppDataMcpServer() {
     }
   );
 
-  server.tool(
+  if (enabledTools.has("connector_status")) server.tool(
     "connector_status",
     "Show whether Metabase, PostHog, and StarRocks connector environment variables are configured. Secrets are never returned.",
     {},
@@ -409,6 +420,7 @@ export function createAppDataMcpServer() {
         const posthog = getPostHogConfig();
         const starrocks = getStarRocksConfig();
         const audit = getAuditConfig();
+        const metadata = getMetadataConfig();
         const requestContext = getRequestContext();
 
         return toTextPayload({
@@ -429,6 +441,14 @@ export function createAppDataMcpServer() {
             ssl: audit.ssl,
             sslCertificateVerification: audit.ssl && audit.sslRejectUnauthorized,
             sslCaFileConfigured: Boolean(audit.sslCaFile)
+          },
+          metadata: {
+            dbType: metadata.dbType,
+            hostConfigured: Boolean(metadata.host),
+            database: metadata.database,
+            schema: metadata.schema,
+            table: metadata.table,
+            defaultPublished: metadata.defaultPublished
           },
           allowedOperations: ["search", "read_metadata", "trace_source", "run_readonly_query"],
           deniedOperations: ["create", "update", "delete", "write_back", "save_dashboard", "save_card"],
@@ -455,6 +475,12 @@ export function createAppDataMcpServer() {
           },
           starrocks: {
             configured: starrocks.configured,
+            toolEnabled: enabledTools.has("query_starrocks"),
+            availability: !enabledTools.has("query_starrocks")
+              ? "tool_disabled"
+              : starrocks.configured
+                ? "available"
+                : "connector_not_configured",
             hostConfigured: Boolean(starrocks.host),
             port: starrocks.port,
             userConfigured: Boolean(starrocks.user),
@@ -462,6 +488,14 @@ export function createAppDataMcpServer() {
             ssl: starrocks.ssl,
             queryTimeoutMs: starrocks.queryTimeoutMs,
             missing: starrocks.missing
+          },
+          toolAvailability: {
+            enabled: managedTools.filter((tool) => tool.enabled).map((tool) => tool.name),
+            disabled: managedTools.filter((tool) => !tool.enabled).map((tool) => ({
+              name: tool.name,
+              title: tool.title,
+              reason: "disabled_by_administrator"
+            }))
           }
         });
       });
@@ -520,7 +554,7 @@ async function requireMetadataAccess(asset: import("./types.js").DataAsset) {
       error: "metadata_access_denied",
       asset_id: asset.id,
       reason: snapshotDecision.reason,
-      message: "This asset is hidden by the local metadata access snapshot."
+      message: "This asset is hidden by the synchronized metadata access snapshot."
     });
   }
 

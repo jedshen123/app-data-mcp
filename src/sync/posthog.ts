@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { getPostHogConfig } from "../config.js";
+import { upsertPlatformAssets } from "../metadataStore.js";
 import type { AssetParameter, DataAsset } from "../types.js";
-import { replacePlatformAssets } from "./catalogFile.js";
 import { asArray, fetchJson, getNumber, getObject, getString, isObject, joinUrl } from "./http.js";
 
 const config = getPostHogConfig();
@@ -20,12 +20,12 @@ if (!config.baseUrl || !config.projectId || !config.personalApiKey) {
 
 try {
   const assets = await syncPostHogAssets();
-  const catalog = await replacePlatformAssets("posthog", assets);
+  const result = await upsertPlatformAssets("posthog", assets);
   const dashboardCount = assets.filter((asset) => asset.type === "dashboard").length;
   const insightCount = assets.filter((asset) => asset.type === "insight").length;
 
   console.log(
-    `Synced PostHog metadata: ${dashboardCount} dashboards, ${insightCount} insights. Catalog now has ${catalog.assets.length} assets.`
+    `Synced PostHog metadata to PostgreSQL: ${dashboardCount} dashboards, ${insightCount} insights, ${result.synced} upserted.`
   );
 } catch (error) {
   console.error("Failed to sync PostHog metadata:", error);
