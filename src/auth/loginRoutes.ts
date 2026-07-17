@@ -67,7 +67,7 @@ function renderLoginPage() {
     <input id="password" name="password" type="password" autocomplete="current-password" required />
     <button type="submit">授权</button>
   </form>
-  <p class="hint">不会保存你的密码；个人 MCP token 不按时间失效。同一账号重新授权后，之前的 token 将立即失效。</p>
+  <p class="hint">不会保存你的密码；个人 MCP token 不按时间失效。同一账号重新授权只更新 Metabase Session，之前配置的个人 MCP token 继续有效。</p>
 </body>
 </html>`;
 }
@@ -92,7 +92,7 @@ function renderSuccessPage(input: { user: string; mcpToken: string }) {
 </head>
 <body>
   <h1>授权成功</h1>
-  <p>已为 ${escapeHtml(input.user)} 保存数据平台登录会话。本次生成的个人 MCP token 不按时间失效，该账号之前的 token 已失效。请把下面的新 token 配到你的 AI 助手中；token 只展示这一次。</p>
+  <p>已为 ${escapeHtml(input.user)} 保存数据平台登录会话。本次生成的个人 MCP token 不按时间失效，该账号之前配置的 token 也继续有效。新客户端可以使用下面的新 token；token 只展示这一次。</p>
   <div class="token-row">
     <code id="token">${escapeHtml(authorizationHeader)}</code>
     <button type="button" id="copy-token">复制</button>

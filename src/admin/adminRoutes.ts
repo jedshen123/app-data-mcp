@@ -33,7 +33,12 @@ export function registerAdminRoutes(app: Express): void {
     try {
       const session = await loginAdmin(username, password);
       setAdminCookie(req, res, session);
-      res.json({ user: session.user, csrfToken: session.csrfToken, expiresAt: new Date(session.expiresAt).toISOString() });
+      res.json({
+        user: session.user,
+        csrfToken: session.csrfToken,
+        expiresAt: session.expiresAt === null ? null : new Date(session.expiresAt).toISOString(),
+        persistent: session.expiresAt === null
+      });
     } catch (error) {
       res.status(401).json({ error: error instanceof Error ? error.message : String(error) });
     }
@@ -41,7 +46,12 @@ export function registerAdminRoutes(app: Express): void {
 
   app.get("/admin/api/session", requireAdmin, async (req, res) => {
     const session = (await getAdminSession(req))!;
-    res.json({ user: session.user, csrfToken: session.csrfToken, expiresAt: new Date(session.expiresAt).toISOString() });
+    res.json({
+      user: session.user,
+      csrfToken: session.csrfToken,
+      expiresAt: session.expiresAt === null ? null : new Date(session.expiresAt).toISOString(),
+      persistent: session.expiresAt === null
+    });
   });
 
   app.post("/admin/api/logout", requireAdminMutation, async (req, res) => {
@@ -178,10 +188,12 @@ export function registerAdminRoutes(app: Express): void {
 }
 
 async function requireAdmin(req: Request, res: Response, next: NextFunction): Promise<void> {
-  if (!await getAdminSession(req)) {
+  const session = await getAdminSession(req);
+  if (!session) {
     res.status(401).json({ error: "管理员登录已失效，请重新登录。" });
     return;
   }
+  setAdminCookie(req, res, session);
   next();
 }
 
@@ -195,6 +207,7 @@ async function requireAdminMutation(req: Request, res: Response, next: NextFunct
     res.status(403).json({ error: "无效的后台操作令牌。" });
     return;
   }
+  setAdminCookie(req, res, session);
   next();
 }
 

@@ -200,6 +200,22 @@ export async function createAppDataMcpServer() {
               warnings: live.warnings
             }, limits.maxResponseBytes);
           } catch (error) {
+            if (asset.platform === "metabase" && isReauthError(error)) {
+              return toTextPayload({
+                asset: summarizeAsset(asset),
+                data: null,
+                params: params ?? {},
+                live: false,
+                error: "reauth_required",
+                message: "Metabase rejected the Session associated with this personal MCP token. The MCP token itself has not expired; reauthorize this Metabase account to replace its platform Session.",
+                loginUrl: getMetabaseLoginUrl(),
+                source: {
+                  url: asset.url,
+                  queryText: asset.queryText,
+                  sourceRefs: asset.sourceRefs ?? []
+                }
+              });
+            }
             if (!asset.sampleData) {
               return toTextPayload({
                 asset: summarizeAsset(asset),
@@ -390,7 +406,7 @@ export async function createAppDataMcpServer() {
             ? {
                 authorized: true,
                 user: metabaseStatus.user,
-                expiresAt: metabaseStatus.expiresAt,
+                localExpiryEnforced: false,
                 sessionProvidedByHeader: Boolean(requestContext.metabaseSession),
                 loginUrl
               }
@@ -522,7 +538,10 @@ function buildAuthNextSteps(user: string | undefined, authorized: boolean, login
 }
 
 function isReauthError(error: unknown): boolean {
-  return error instanceof Error && error.message.includes("reauth_required");
+  return error instanceof Error && (
+    error.message.includes("reauth_required") ||
+    error.message.includes("HTTP 401")
+  );
 }
 
 function requireUserToken() {

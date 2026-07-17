@@ -42,9 +42,10 @@ export function getAuthConfig() {
     publicBaseUrl: process.env.APP_DATA_MCP_PUBLIC_BASE_URL,
     sessionFile: process.env.APP_DATA_SESSION_FILE ?? ".data/metabase-sessions.json",
     metabaseLoginUrl: process.env.METABASE_LOGIN_URL ?? process.env.METABASE_BASE_URL ?? "https://app-data.luteos.site",
-    metabaseAuthMode: process.env.METABASE_AUTH_MODE ?? "service-fallback",
-    allowServiceFallback: readBoolean("METABASE_ALLOW_SERVICE_FALLBACK", true),
+    metabaseAuthMode: process.env.METABASE_AUTH_MODE ?? "user-session",
+    allowServiceFallback: readBoolean("METABASE_ALLOW_SERVICE_FALLBACK", false),
     metabaseSessionTtlHours: readPositiveInt("METABASE_SESSION_TTL_HOURS", 168),
+    adminSessionPersistent: readBoolean("ADMIN_SESSION_PERSISTENT", true),
     adminSessionTtlHours: readPositiveInt("ADMIN_SESSION_TTL_HOURS", 168),
     adminSessionTable: process.env.ADMIN_SESSION_TABLE ?? "app_data_mcp_admin_sessions",
     requireUserHeader: readBoolean("APP_DATA_REQUIRE_AUTH_TOKEN", readBoolean("APP_DATA_REQUIRE_USER_HEADER", true))

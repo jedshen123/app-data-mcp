@@ -44,10 +44,14 @@ export async function loginMetabaseUser(username: string, password: string): Pro
   const now = new Date();
   const expiresAt = new Date(now.getTime() + getAuthConfig().metabaseSessionTtlHours * 60 * 60 * 1000);
   const mcpToken = createMcpToken();
+  const existing = (await readSessionFile()).sessions[normalizeUser(username)];
   const stored: StoredMetabaseSession = {
     user: username,
     session: session.id,
-    mcpTokenHashes: [hashMcpToken(mcpToken)],
+    mcpTokenHashes: [
+      ...(existing ? getStoredTokenHashes(existing) : []),
+      hashMcpToken(mcpToken)
+    ],
     createdAt: now.toISOString(),
     expiresAt: expiresAt.toISOString()
   };
@@ -86,7 +90,7 @@ export async function getStoredMetabaseSessionStatus(user: string | undefined): 
   | {
       authorized: false;
       user?: string;
-      reason: "missing_user" | "missing_session" | "expired_session";
+      reason: "missing_user" | "missing_session";
       expiresAt?: string;
     }
 > {
@@ -103,14 +107,6 @@ export async function getStoredMetabaseSessionStatus(user: string | undefined): 
       authorized: false,
       user,
       reason: "missing_session"
-    };
-  }
-  if (new Date(entry.expiresAt).getTime() <= Date.now()) {
-    return {
-      authorized: false,
-      user: entry.user,
-      reason: "expired_session",
-      expiresAt: entry.expiresAt
     };
   }
   return {

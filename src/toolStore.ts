@@ -19,18 +19,24 @@ export type ManagedTool = {
 const LEGACY_ENGLISH_MCP_SERVER_INSTRUCTIONS =
   "This server is a read-only internal data gateway. Prefer search_assets and run_asset for curated Metabase/PostHog data. Use query_starrocks only when curated assets do not answer the question or the user explicitly asks for SQL. Before querying unfamiliar StarRocks tables, inspect metadata with SHOW/DESCRIBE, then generate a bounded SELECT. Before running live Metabase data tools, call auth_status. If metabase.authorized is false, ask the user to open loginUrl and configure the personal MCP token as Authorization: Bearer <token>. Never ask for passwords in chat.";
 
-export const DEFAULT_MCP_SERVER_INSTRUCTIONS =
+const LEGACY_USER_SESSION_MCP_SERVER_INSTRUCTIONS =
   "这是一个只读的内部数据网关。对于已经治理的 Metabase/PostHog 数据，优先使用 search_assets 查找资产，并使用 run_asset 查询。只有当治理资产无法回答问题，或用户明确要求 SQL 时，才使用 query_starrocks。查询不熟悉的 StarRocks 表之前，先使用 SHOW/DESCRIBE 检查元信息，再生成有明确范围和行数限制的 SELECT。运行 Metabase 实时数据工具前，先调用 auth_status；如果 metabase.authorized 为 false，提示用户打开 loginUrl 完成登录，并将个人 MCP token 配置为 Authorization: Bearer <token>。不要在对话中索取或暴露密码、Session、API Key 等敏感信息。所有查询必须保持只读，并遵守返回行数限制。";
+
+const LEGACY_SERVICE_ACCOUNT_MCP_SERVER_INSTRUCTIONS =
+  "这是一个只读的内部数据网关。对于已经治理的 Metabase/PostHog 数据，优先使用 search_assets 查找资产，并使用 run_asset 查询。只有当治理资产无法回答问题，或用户明确要求 SQL 时，才使用 query_starrocks。查询不熟悉的 StarRocks 表之前，先使用 SHOW/DESCRIBE 检查元信息，再生成有明确范围和行数限制的 SELECT。Metabase 默认使用服务端账号或 API Key，不要求用户维护个人 Metabase Session；如果连接失败，应提示检查服务端连接配置，不要描述为用户授权过期。不要在对话中索取或暴露密码、Session、API Key 等敏感信息。所有查询必须保持只读，并遵守返回行数限制。";
+
+export const DEFAULT_MCP_SERVER_INSTRUCTIONS =
+  "这是一个只读的内部数据网关。对于已经治理的 Metabase/PostHog 数据，优先使用 search_assets 查找资产，并使用 run_asset 查询。只有当治理资产无法回答问题，或用户明确要求 SQL 时，才使用 query_starrocks。查询不熟悉的 StarRocks 表之前，先使用 SHOW/DESCRIBE 检查元信息，再生成有明确范围和行数限制的 SELECT。每个个人 MCP token 对应一个 Metabase 账号，所有 Metabase 查询必须使用该 token 对应账号的权限。MCP 不按本地时间主动判定用户授权过期；只有个人 token 缺失、无对应账号，或 Metabase 实际拒绝当前 Session 时，才提示用户重新授权。不要改用统一服务账号绕过用户权限，也不要在对话中索取或暴露密码、Session、API Key 等敏感信息。所有查询必须保持只读，并遵守返回行数限制。";
 
 export const MCP_TOOL_DEFINITIONS = [
   { name: "search_assets", title: "搜索数据资产", category: "资产发现", riskLevel: "low", description: "搜索已开放的 Metabase、PostHog 和本地元信息，支持平台、类型和业务域过滤。", usageNotes: "通常作为数据分析的第一步。找到合适资产后，再调用 get_asset、trace_asset 或 run_asset。", inputSchema: { query: "string，关键词，默认空字符串", platform: "metabase | posthog | local，可选", type: "dashboard | card | insight | metric | table | event，可选", domain: "string，业务域，可选", limit: "integer，返回数量" } },
-  { name: "get_asset", title: "查看资产详情", category: "元信息", riskLevel: "low", description: "读取单个资产的完整元信息，包括链接、查询定义、字段、参数和警告。", usageNotes: "需要先通过 search_assets 获得统一资产 ID；Metabase 资产还会实时校验当前用户权限。", inputSchema: { asset_id: "string，必填，例如 metabase:card:456" } },
+  { name: "get_asset", title: "查看资产详情", category: "元信息", riskLevel: "low", description: "读取单个资产的完整元信息，包括链接、查询定义、字段、参数和警告。", usageNotes: "需要先通过 search_assets 获得统一资产 ID；Metabase 资产会使用个人 MCP token 对应账号实时校验权限。", inputSchema: { asset_id: "string，必填，例如 metabase:card:456" } },
   { name: "trace_asset", title: "追踪资产来源", category: "元信息", riskLevel: "low", description: "查看资产的查询定义、字段、上游来源、引用资产和原始平台链接。", usageNotes: "用于解释数据出处、SQL、字段和上游依赖，不执行数据查询。", inputSchema: { asset_id: "string，必填" } },
-  { name: "run_asset", title: "运行数据资产", category: "数据查询", riskLevel: "medium", description: "使用当前用户权限实时运行 Metabase 卡片/Dashboard 或 PostHog Insight，并限制返回行数。", usageNotes: "优先运行已治理资产。Metabase 调用前建议先检查 auth_status；参数应来自资产 parameters。", inputSchema: { asset_id: "string，必填", params: "object，可选，友好参数或平台原生参数", limit: "integer，返回行数限制" } },
+  { name: "run_asset", title: "运行数据资产", category: "数据查询", riskLevel: "medium", description: "使用个人 MCP token 对应的 Metabase 账号权限运行卡片/Dashboard，或运行 PostHog Insight，并限制返回行数。", usageNotes: "优先运行已治理资产。Metabase 调用按 token 对应账号鉴权；参数应来自资产 parameters。", inputSchema: { asset_id: "string，必填", params: "object，可选，友好参数或平台原生参数", limit: "integer，返回行数限制" } },
   { name: "query_starrocks", title: "查询 StarRocks", category: "数据查询", riskLevel: "high", description: "执行受控的只读 StarRocks SQL，允许 SELECT、WITH、SHOW、DESCRIBE 和 EXPLAIN。", usageNotes: "仅在治理资产不能回答问题或用户明确要求 SQL 时使用；陌生表应先 SHOW/DESCRIBE。", inputSchema: { sql: "string，必填，单条只读 SQL", limit: "integer，返回行数限制" } },
   { name: "list_domains", title: "列出业务域", category: "资产发现", riskLevel: "low", description: "列出当前用户可见的已开放资产业务域。", usageNotes: "可用于帮助 AI 缩小 search_assets 的 domain 范围。", inputSchema: {} },
   { name: "catalog_status", title: "查看目录状态", category: "运行状态", riskLevel: "low", description: "查看已开放元信息数量、平台和类型统计以及同步新鲜度。", usageNotes: "用于排查搜索不到资产、同步过期或目录未初始化问题。", inputSchema: {} },
-  { name: "auth_status", title: "查看授权状态", category: "认证", riskLevel: "low", description: "检查当前 MCP 用户及其 Metabase 会话是否已授权，并返回重新登录提示。", usageNotes: "运行 Metabase 资产前调用；不返回密码或平台密钥。", inputSchema: {} },
+  { name: "auth_status", title: "查看授权状态", category: "认证", riskLevel: "low", description: "检查个人 MCP token 是否已映射到 Metabase 账号及可用 Session，不返回任何密钥。", usageNotes: "本地不按时间主动过期；只有缺少映射或 Metabase 实际拒绝 Session 时才需要重新授权。", inputSchema: {} },
   { name: "connector_status", title: "查看连接器状态", category: "运行状态", riskLevel: "low", description: "查看 Metabase、PostHog、StarRocks、元信息库和审计配置是否完整，不返回密钥。", usageNotes: "用于部署排障，只返回是否配置及非敏感连接信息。", inputSchema: {} }
 ] as const;
 
@@ -210,8 +216,8 @@ async function initializeToolTable(): Promise<void> {
     await connection.query(
       `update ${settingsTableName}
        set setting_value = $1, updated_at = now(), updated_by = 'system-default-migration'
-       where setting_key = 'global_instructions' and setting_value = $2`,
-      [DEFAULT_MCP_SERVER_INSTRUCTIONS, LEGACY_ENGLISH_MCP_SERVER_INSTRUCTIONS]
+       where setting_key = 'global_instructions' and setting_value = any($2::text[])`,
+      [DEFAULT_MCP_SERVER_INSTRUCTIONS, [LEGACY_ENGLISH_MCP_SERVER_INSTRUCTIONS, LEGACY_USER_SESSION_MCP_SERVER_INSTRUCTIONS, LEGACY_SERVICE_ACCOUNT_MCP_SERVER_INSTRUCTIONS]]
     );
     for (const tool of MCP_TOOL_DEFINITIONS) {
       await connection.query(

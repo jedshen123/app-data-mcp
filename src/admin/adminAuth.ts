@@ -5,12 +5,13 @@ import { getMetadataPool, qualifiedName, quoteIdentifier } from "../metadataStor
 import { fetchJson, joinUrl } from "../sync/http.js";
 
 const ADMIN_COOKIE = "app_data_admin";
+const PERSISTENT_COOKIE_MAX_AGE_MS = 400 * 24 * 60 * 60 * 1000;
 
 type AdminSession = {
   token: string;
   csrfToken: string;
   user: string;
-  expiresAt: number;
+  expiresAt: number | null;
 };
 
 let initialized = false;
@@ -36,7 +37,9 @@ export async function loginAdmin(username: string, password: string): Promise<Ad
     token,
     csrfToken: randomBytes(24).toString("base64url"),
     user,
-    expiresAt: Date.now() + getAuthConfig().adminSessionTtlHours * 60 * 60 * 1000
+    expiresAt: getAuthConfig().adminSessionPersistent
+      ? null
+      : Date.now() + getAuthConfig().adminSessionTtlHours * 60 * 60 * 1000
   };
   await saveAdminSession(session);
   return session;
@@ -48,7 +51,9 @@ export function setAdminCookie(req: Request, res: Response, session: AdminSessio
     sameSite: "strict",
     secure: req.secure || req.header("x-forwarded-proto") === "https",
     path: "/admin",
-    maxAge: Math.max(session.expiresAt - Date.now(), 0)
+    maxAge: session.expiresAt === null
+      ? PERSISTENT_COOKIE_MAX_AGE_MS
+      : Math.max(session.expiresAt - Date.now(), 0)
   });
 }
 
@@ -72,10 +77,10 @@ export async function getAdminSession(req: Request): Promise<AdminSession | unde
   await ensureAdminSessionTable();
   const pool = await getMetadataPool();
   const config = getAuthConfig();
-  const result = await pool.query<{ user_email: string; csrf_token: string; expires_at: Date }>(
+  const result = await pool.query<{ user_email: string; csrf_token: string; expires_at: Date | null }>(
     `select user_email, csrf_token, expires_at
      from ${qualifiedName(process.env.DB_SCHEMA ?? "public", config.adminSessionTable)}
-     where token_hash = $1 and expires_at > now()`,
+     where token_hash = $1 and (expires_at is null or expires_at > now())`,
     [hashToken(token)]
   );
   const row = result.rows[0];
@@ -84,7 +89,7 @@ export async function getAdminSession(req: Request): Promise<AdminSession | unde
     token,
     csrfToken: row.csrf_token,
     user: row.user_email,
-    expiresAt: row.expires_at.getTime()
+    expiresAt: row.expires_at?.getTime() ?? null
   };
 }
 
@@ -113,7 +118,7 @@ async function saveAdminSession(session: AdminSession): Promise<void> {
     `insert into ${qualifiedName(process.env.DB_SCHEMA ?? "public", config.adminSessionTable)}
        (token_hash, user_email, csrf_token, created_at, expires_at)
      values ($1, $2, $3, now(), $4)`,
-    [hashToken(session.token), session.user, session.csrfToken, new Date(session.expiresAt)]
+    [hashToken(session.token), session.user, session.csrfToken, session.expiresAt === null ? null : new Date(session.expiresAt)]
   );
 }
 
@@ -141,11 +146,15 @@ async function initializeAdminSessionTable(): Promise<void> {
       user_email text not null,
       csrf_token text not null,
       created_at timestamptz not null default now(),
-      expires_at timestamptz not null
+      expires_at timestamptz
     )`);
+    await connection.query(`alter table ${tableName} alter column expires_at drop not null`);
     await connection.query(`create index if not exists ${quoteIdentifier(`${config.adminSessionTable}_user_idx`)} on ${tableName} (user_email, expires_at desc)`);
     await connection.query(`create index if not exists ${quoteIdentifier(`${config.adminSessionTable}_expires_idx`)} on ${tableName} (expires_at)`);
-    await connection.query(`delete from ${tableName} where expires_at <= now()`);
+    await connection.query(`delete from ${tableName} where expires_at is not null and expires_at <= now()`);
+    if (config.adminSessionPersistent) {
+      await connection.query(`update ${tableName} set expires_at = null where expires_at is not null`);
+    }
     await connection.query("commit");
   } catch (error) {
     await connection.query("rollback").catch(() => undefined);

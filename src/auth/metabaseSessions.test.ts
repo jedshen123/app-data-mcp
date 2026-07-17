@@ -4,9 +4,9 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { getUserForMcpToken } from "./metabaseSessions.js";
+import { getStoredMetabaseSessionStatus, getUserForMcpToken } from "./metabaseSessions.js";
 
-test("personal MCP tokens ignore session expiry and old tokens fail after rotation", async (context) => {
+test("personal MCP tokens ignore local session expiry", async (context) => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "app-data-mcp-auth-"));
   const sessionFile = path.join(directory, "sessions.json");
   const previousSessionFile = process.env.APP_DATA_SESSION_FILE;
@@ -41,6 +41,9 @@ test("personal MCP tokens ignore session expiry and old tokens fail after rotati
   assert.equal(await getUserForMcpToken(legacyToken), "user@example.com");
   assert.equal(await getUserForMcpToken(currentToken), "user@example.com");
   assert.equal(await getUserForMcpToken("appdata_unknown"), undefined);
+  const oldSessionStatus = await getStoredMetabaseSessionStatus("user@example.com");
+  assert.equal(oldSessionStatus.authorized, true);
+  if (oldSessionStatus.authorized) assert.equal(oldSessionStatus.session, "expired-platform-session");
 
   await fs.writeFile(
     sessionFile,

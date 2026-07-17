@@ -268,6 +268,8 @@ npm run sync:all
 
 Metabase 同步会为 dashboard/card 写入权限快照 `asset.access`，包括 collection、creator、archived、personal collection、同步时间等。MCP 使用两级过滤：
 
+卡片同步会在读取 `/api/card` 列表后，以受限并发继续读取 `/api/card/:id` 详情，并优先使用详情中的 `dataset_query`、`result_metadata`、参数和更新时间，避免列表接口中的旧字段缓存覆盖 PostgreSQL 元信息。详情请求失败时会保留列表数据，并在同步日志和资产 `warnings` 中标记。
+
 - `search_assets` / `list_domains`: 用本地权限快照快速过滤归档资产和非本人 personal collection。
 - `get_asset` / `trace_asset`: 先做本地快照过滤，再用当前用户 Metabase session 实时请求 `GET /api/card/:id` 或 `GET /api/dashboard/:id` 校验可见性。
 - `run_asset`: 继续使用用户 Metabase session 执行只读查询，保留平台实时权限判断。
@@ -389,86 +391,37 @@ Metabase connector 会用这组配置调用 `POST /api/session` 换取 session i
 
 可以通过 MCP tool `connector_status` 检查配置是否齐全；它只返回是否配置和认证模式，不返回密钥或密码。
 
-## Metabase 用户授权
+## Metabase 用户授权与后台管理员登录
 
-多人使用时，推荐复用 Metabase 用户权限。配置为：
+每个用户配置个人 MCP token，服务端用 token 反查对应的 Metabase 账号和 Session，并严格按该账号权限查询：
 
 ```bash
 METABASE_BASE_URL=https://app-data.luteos.site
 METABASE_LOGIN_URL=https://app-data.luteos.site
 METABASE_AUTH_MODE=user-session
 METABASE_ALLOW_SERVICE_FALLBACK=false
-METABASE_SESSION_TTL_HOURS=168
-APP_DATA_SESSION_FILE=.data/metabase-sessions.json
 APP_DATA_MCP_PUBLIC_BASE_URL=http://127.0.0.1:3000
 APP_DATA_REQUIRE_AUTH_TOKEN=true
+APP_DATA_SESSION_FILE=.data/metabase-sessions.json
 ```
 
-用户首次使用前打开：
+个人 MCP token 本身不按时间过期，MCP 也不再使用 `METABASE_SESSION_TTL_HOURS` 主动判定底层 Session 过期。只要 Metabase 接受该 Session，服务就持续使用它。只有 Metabase 实际返回 HTTP 401 时，才返回 `reauth_required`，要求对应账号重新授权以替换平台 Session；重新授权不会使该账号已经配置到客户端的个人 MCP token 失效，也不会自动切换到统一服务账号绕过用户权限。
+
+用户首次授权打开：
 
 ```text
 http://127.0.0.1:3000/auth/metabase/login
 ```
 
-输入数据平台的账号密码。MCP 会调用 Metabase `POST /api/session` 完成底层权限校验，只保存用户 session，不保存密码。
+授权后将页面生成的 `Authorization: Bearer appdata_xxx` 配置到 AI 助手。服务端只保存 token 哈希和 Metabase Session，不保存用户密码。
 
-`METABASE_SESSION_TTL_HOURS` 只控制底层数据平台登录会话的本地有效期，不控制个人 MCP token。
-
-授权成功后，页面会展示一次不按时间失效的个人 MCP token：
+管理后台仍然要求使用 Metabase 管理员账号登录：
 
 ```text
-Authorization: Bearer appdata_xxx
+http://127.0.0.1:3000/admin
 ```
 
-服务端只保存 token 的哈希，并用 token 反查真实用户邮箱，再使用该用户的 Metabase session 查询数据。个人 MCP token 不按时间失效；同一账号重新授权时会轮换 token，只保留本次新 token，之前签发的所有 token 立即失效。这样其他人即使知道某个同事邮箱，也不能冒用他的权限。
-
-如果没有有效的个人 MCP token，数据类 tools 会直接返回 `auth_required`，不会搜索资产或执行查询。允许匿名使用时可以设置：
-
-```bash
-APP_DATA_REQUIRE_AUTH_TOKEN=false
-```
-
-Claude Code 示例：
-
-```bash
-claude mcp add --transport http app-data http://127.0.0.1:3000/mcp \
-  --header "Authorization: Bearer appdata_your-personal-token" \
-  --header "X-App-Data-Client: claude-code"
-```
-
-Codex `~/.codex/config.toml` 示例：
-
-```toml
-[mcp_servers.app-data]
-url = "http://127.0.0.1:3000/mcp"
-http_headers = { "Authorization" = "Bearer appdata_your-personal-token", "X-App-Data-Client" = "codex" }
-enabled = true
-tool_timeout_sec = 120
-```
-
-接入后可以先让 AI 调用：
-
-```text
-auth_status
-```
-
-如果未授权，返回中会包含 `loginUrl` 和下一步操作。MCP server instructions 也会提示 AI：执行 Metabase 真实取数前先检查 `auth_status`，不要在对话里索要密码。
-
-如果 AI 平台能直接转发用户 Metabase session，也可以带：
-
-```text
-X-Metabase-Session: <user-metabase-session>
-```
-
-Metabase 查询优先级：
-
-1. 请求里的 `X-Metabase-Session`
-2. `.data/metabase-sessions.json` 中保存的用户 session
-3. 服务账号 fallback，仅当 `METABASE_ALLOW_SERVICE_FALLBACK=true`
-
-当 `METABASE_AUTH_MODE=user-session` 或 `METABASE_ALLOW_SERVICE_FALLBACK=false` 时，没有用户 session 会返回 `reauth_required` 和登录链接。
-
-注意：`.data/metabase-sessions.json` 含有用户 session，已经被 `.gitignore` 忽略。生产环境建议改成 Redis、数据库或加密存储。
+只保存随机后台 Session 的哈希、CSRF token 和管理员邮箱到 PostgreSQL，不保存管理员密码。设置 `ADMIN_SESSION_PERSISTENT=true` 后，后台 Session 默认不设置服务端过期时间，并在管理员访问后台时滚动刷新浏览器 Cookie；服务重启不会要求重新登录。主动退出、清理数据库 Session 或浏览器清除 Cookie 后仍需重新登录。
 
 ## 审计日志
 

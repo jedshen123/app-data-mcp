@@ -23,6 +23,8 @@ type SyncStats = {
   accessSnapshots: number;
 };
 
+const CARD_DETAIL_CONCURRENCY = 8;
+
 const config = getMetabaseConfig();
 
 if (config.mode === "missing") {
@@ -87,7 +89,13 @@ async function syncMetabaseAssets(client: MetabaseClient): Promise<DataAsset[]> 
   ]);
 
   const dashboards = await Promise.all(dashboardsRaw.map((dashboard) => toDashboardAsset(client, dashboard)));
-  const cards = cardsRaw.map((card) => toCardAsset(client, card));
+  const cards = await mapWithConcurrency(cardsRaw, CARD_DETAIL_CONCURRENCY, async (card) => {
+    const id = String(getNumber(card.id) ?? getString(card.id) ?? "");
+    const detail = id ? await readCardDetail(client, id) : undefined;
+    return toCardAsset(client, detail ? { ...card, ...detail } : card, {
+      detailLoaded: Boolean(detail)
+    });
+  });
   return [...dashboards, ...cards];
 }
 
@@ -142,6 +150,17 @@ async function readDashboardDetail(client: MetabaseClient, dashboardId: string):
       headers: client.headers
     });
   } catch {
+    return undefined;
+  }
+}
+
+async function readCardDetail(client: MetabaseClient, cardId: string): Promise<Record<string, unknown> | undefined> {
+  try {
+    return await fetchJson<Record<string, unknown>>(joinUrl(client.baseUrl, `/api/card/${cardId}`), {
+      headers: client.headers
+    });
+  } catch (error) {
+    console.warn(`Unable to read Metabase card detail for card ${cardId}; using list metadata instead.`, error);
     return undefined;
   }
 }
@@ -205,7 +224,11 @@ function readRawDashboardCards(detail: Record<string, unknown> | undefined): Rec
   return dashcards.filter((dashcard): dashcard is Record<string, unknown> => typeof dashcard === "object" && dashcard !== null);
 }
 
-function toCardAsset(client: MetabaseClient, card: Record<string, unknown>): DataAsset {
+function toCardAsset(
+  client: MetabaseClient,
+  card: Record<string, unknown>,
+  options: { detailLoaded: boolean }
+): DataAsset {
   const id = String(getNumber(card.id) ?? getString(card.id) ?? "");
   const name = getString(card.name) ?? getString(card.title) ?? `Metabase card ${id}`;
   const datasetQuery = getObject(card.dataset_query);
@@ -242,8 +265,32 @@ function toCardAsset(client: MetabaseClient, card: Record<string, unknown>): Dat
     access: buildMetabaseAccessSnapshot(card, {
       dashboardId
     }),
-    warnings: ["Synced metadata only. Query execution remains read-only and row-limited."]
+    warnings: compact([
+      "Synced metadata only. Query execution remains read-only and row-limited.",
+      options.detailLoaded
+        ? undefined
+        : "Metabase card detail could not be loaded; columns may come from stale list metadata."
+    ])
   };
+}
+
+async function mapWithConcurrency<T, R>(
+  values: T[],
+  concurrency: number,
+  mapper: (value: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const results = new Array<R>(values.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (nextIndex < values.length) {
+      const index = nextIndex++;
+      results[index] = await mapper(values[index], index);
+    }
+  }
+
+  await Promise.all(Array.from({ length: Math.min(concurrency, values.length) }, () => worker()));
+  return results;
 }
 
 function readMetabaseDashboardParameters(detail: Record<string, unknown> | undefined): AssetParameter[] | undefined {
