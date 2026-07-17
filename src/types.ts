@@ -3,6 +3,7 @@ export type DataPlatform = "metabase" | "posthog" | "local";
 export type DataAssetType =
   | "dashboard"
   | "card"
+  | "model"
   | "insight"
   | "metric"
   | "table"
@@ -10,6 +11,7 @@ export type DataAssetType =
 
 export type ColumnMeta = {
   name: string;
+  displayName?: string;
   type: string;
   description?: string;
 };

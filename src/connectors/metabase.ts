@@ -26,7 +26,7 @@ type NormalizedResult = {
 
 export async function runMetabaseAsset(asset: DataAsset, options: RunOptions) {
   const client = await createMetabaseClient();
-  if (asset.type === "card") {
+  if (asset.type === "card" || asset.type === "model") {
     const cardId = getAssetNumericId(asset.id);
     const result = await runMetabaseCard(client, cardId, asset.parameters, options);
     return {

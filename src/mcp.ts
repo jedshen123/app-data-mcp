@@ -44,11 +44,11 @@ export async function createAppDataMcpServer() {
 
   if (enabledTools.has("search_assets")) server.tool(
     "search_assets",
-    "Search published PostgreSQL metadata for Metabase dashboards/cards, PostHog insights, metrics, tables, and events.",
+    "Search published PostgreSQL metadata for Metabase dashboards/cards/models, PostHog insights, metrics, tables, and events.",
     {
       query: z.string().default("").describe("Keyword query, e.g. 新增用户, activation, retention."),
       platform: z.enum(["metabase", "posthog", "local"]).optional(),
-      type: z.enum(["dashboard", "card", "insight", "metric", "table", "event"]).optional(),
+      type: z.enum(["dashboard", "card", "model", "insight", "metric", "table", "event"]).optional(),
       domain: z.string().optional().describe("Business domain, e.g. growth, product, revenue."),
       limit: z.number().int().min(1).max(limits.maxSearchLimit).default(limits.defaultSearchLimit)
     },
@@ -91,7 +91,7 @@ export async function createAppDataMcpServer() {
     {
       asset_id: z
         .string()
-        .describe("Unified asset id, e.g. metabase:card:456 or posthog:insight:activation-funnel.")
+        .describe("Unified asset id, e.g. metabase:card:456, metabase:model:388, or posthog:insight:activation-funnel.")
     },
     async ({ asset_id }) => {
       const auditDetails: AuditDetails = { assetId: asset_id };

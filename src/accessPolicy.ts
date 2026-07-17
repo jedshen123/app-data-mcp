@@ -30,7 +30,7 @@ export function canReadAssetMetadataFromSnapshot(asset: DataAsset, user: string 
 
 export async function canReadAssetMetadataLive(asset: DataAsset): Promise<AccessDecision> {
   if (asset.platform !== "metabase") return { allowed: true };
-  if (asset.type !== "card" && asset.type !== "dashboard") return { allowed: true };
+  if (asset.type !== "card" && asset.type !== "model" && asset.type !== "dashboard") return { allowed: true };
 
   const requestContext = getRequestContext();
   const config = getMetabaseConfig();

@@ -19,6 +19,7 @@ type MetabaseClient = {
 type SyncStats = {
   dashboards: number;
   cards: number;
+  models: number;
   totalAssets: number;
   accessSnapshots: number;
 };
@@ -39,12 +40,13 @@ try {
   const stats: SyncStats = {
     dashboards: assets.filter((asset) => asset.type === "dashboard").length,
     cards: assets.filter((asset) => asset.type === "card").length,
+    models: assets.filter((asset) => asset.type === "model").length,
     totalAssets: assets.length,
     accessSnapshots: assets.filter((asset) => asset.access?.source === "metabase-sync").length
   };
 
   console.log(
-    `Synced Metabase metadata to PostgreSQL: ${stats.dashboards} dashboards, ${stats.cards} cards, ${stats.accessSnapshots} access snapshots, ${result.synced} upserted.`
+    `Synced Metabase metadata to PostgreSQL: ${stats.dashboards} dashboards, ${stats.cards} cards, ${stats.models} models, ${stats.accessSnapshots} access snapshots, ${result.synced} upserted.`
   );
 } catch (error) {
   console.error("Failed to sync Metabase metadata:", error);
@@ -173,9 +175,12 @@ function readDashboardChildren(detail: Record<string, unknown> | undefined): str
       : [];
   const children = dashcards
     .filter((dashcard): dashcard is Record<string, unknown> => typeof dashcard === "object" && dashcard !== null)
-    .map((dashcard) => getNumber(dashcard.card_id) ?? getNumber(getObject(dashcard.card)?.id))
-    .filter((cardId): cardId is number => cardId !== undefined)
-    .map((cardId) => `metabase:card:${cardId}`);
+    .flatMap((dashcard): string[] => {
+      const card = getObject(dashcard.card);
+      const cardId = getNumber(dashcard.card_id) ?? getNumber(card?.id);
+      if (cardId === undefined) return [];
+      return [`metabase:${isMetabaseModel(card) ? "model" : "card"}:${cardId}`];
+    });
   return children.length ? children : undefined;
 }
 
@@ -241,17 +246,20 @@ function toCardAsset(
     getNumber(card.dashboard_id) ??
     getNumber(card.dashboardId) ??
     getNumber(getObject(card.dashboard)?.id);
+  const isModel = isMetabaseModel(card);
+  const assetType = isModel ? "model" : "card";
+  const route = isModel ? "model" : "question";
 
   return {
-    id: `metabase:card:${id}`,
+    id: `metabase:${assetType}:${id}`,
     platform: "metabase",
-    type: "card",
+    type: assetType,
     title: name,
     description: getString(card.description),
     businessDomain: getString(collection?.name),
-    tags: compact(["metabase", "card", getString(card.display), getString(collection?.name)]),
+    tags: compact(["metabase", assetType, getString(card.display), getString(collection?.name)]),
     owner: getCreatorName(card),
-    url: joinUrl(client.publicUrl, `/question/${id}`),
+    url: joinUrl(client.publicUrl, `/${route}/${id}`),
     updatedAt: getString(card.updated_at) ?? getString(card.created_at),
     queryText,
     columns,
@@ -259,7 +267,7 @@ function toCardAsset(
     sourceRefs: [
       {
         system: "metabase",
-        url: joinUrl(client.publicUrl, `/question/${id}`)
+        url: joinUrl(client.publicUrl, `/${route}/${id}`)
       }
     ],
     access: buildMetabaseAccessSnapshot(card, {
@@ -435,12 +443,17 @@ function readMetabaseColumns(card: Record<string, unknown>): ColumnMeta[] | unde
   const columns = metadata
     .map((column) => ({
       name: getString(column.name) ?? getString(column.display_name) ?? "",
+      displayName: getString(column.display_name),
       type: getString(column.base_type) ?? getString(column.semantic_type) ?? "unknown",
-      description: getString(column.description) ?? getString(column.display_name)
+      description: getString(column.description)
     }))
     .filter((column) => column.name);
 
   return columns.length ? columns : undefined;
+}
+
+function isMetabaseModel(card: Record<string, unknown> | undefined): boolean {
+  return getString(card?.type)?.toLowerCase() === "model" || card?.dataset === true;
 }
 
 function getCreatorName(value: Record<string, unknown>): string | undefined {

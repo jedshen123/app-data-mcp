@@ -267,7 +267,7 @@ function readPlatform(value: unknown): DataPlatform | undefined {
 }
 
 function readAssetType(value: unknown): DataAssetType | undefined {
-  const allowed: DataAssetType[] = ["dashboard", "card", "insight", "metric", "table", "event"];
+  const allowed: DataAssetType[] = ["dashboard", "card", "model", "insight", "metric", "table", "event"];
   return typeof value === "string" && allowed.includes(value as DataAssetType)
     ? value as DataAssetType
     : undefined;

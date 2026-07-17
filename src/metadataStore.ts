@@ -94,6 +94,16 @@ export async function upsertPlatformAssets(platform: DataPlatform, assets: DataA
     await connection.query("begin");
     await connection.query(`update ${tableName} set is_active = false, updated_at = now() where platform = $1`, [platform]);
     for (const asset of uniqueAssets) {
+      const previousAssetId = getPreviousMetabaseAssetId(asset);
+      if (previousAssetId) {
+        await connection.query(
+          `update ${tableName}
+           set asset_id = $1, updated_at = now()
+           where asset_id = $2
+             and not exists (select 1 from ${tableName} where asset_id = $1)`,
+          [asset.id, previousAssetId]
+        );
+      }
       await connection.query(
         `insert into ${tableName} (
           asset_id, platform, asset_type, title, metadata, is_published, is_active,
@@ -438,6 +448,17 @@ async function initializeMetadataTable(pool: Pool): Promise<void> {
 
 function dedupeAssets(assets: DataAsset[]): DataAsset[] {
   return Array.from(new Map(assets.map((asset) => [asset.id, asset])).values());
+}
+
+function getPreviousMetabaseAssetId(asset: DataAsset): string | undefined {
+  if (asset.platform !== "metabase") return undefined;
+  if (asset.type === "model" && asset.id.startsWith("metabase:model:")) {
+    return asset.id.replace("metabase:model:", "metabase:card:");
+  }
+  if (asset.type === "card" && asset.id.startsWith("metabase:card:")) {
+    return asset.id.replace("metabase:card:", "metabase:model:");
+  }
+  return undefined;
 }
 
 function parseTimestamp(value: string | undefined): string | undefined {

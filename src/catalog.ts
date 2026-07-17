@@ -5,6 +5,7 @@ import type { AssetCatalog, DataAsset, DataAssetType, DataPlatform } from "./typ
 
 const columnSchema = z.object({
   name: z.string(),
+  displayName: z.string().optional(),
   type: z.string(),
   description: z.string().optional()
 });
@@ -62,7 +63,7 @@ const dashboardParameterMappingSchema = z.object({
 const assetSchema = z.object({
   id: z.string(),
   platform: z.enum(["metabase", "posthog", "local"]),
-  type: z.enum(["dashboard", "card", "insight", "metric", "table", "event"]),
+  type: z.enum(["dashboard", "card", "model", "insight", "metric", "table", "event"]),
   title: z.string(),
   description: z.string().optional(),
   businessDomain: z.string().optional(),
@@ -182,7 +183,7 @@ export class CatalogStore {
             asset.owner,
             asset.tags.join(" "),
             asset.queryText,
-            asset.columns?.map((column) => `${column.name} ${column.description ?? ""}`).join(" "),
+            asset.columns?.map((column) => `${column.name} ${column.displayName ?? ""} ${column.description ?? ""}`).join(" "),
             asset.parameters?.map((parameter) => `${parameter.name} ${parameter.label ?? ""} ${parameter.description ?? ""}`).join(" "),
             asset.dashboardParameterMappings
               ?.map((mapping) => `${mapping.parameterId} ${mapping.parameterName ?? ""} ${mapping.cardTitle ?? ""}`)
