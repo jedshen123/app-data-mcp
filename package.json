@@ -13,6 +13,7 @@
     "sync:all": "npm run sync:metabase && npm run sync:posthog",
     "test:auth": "npm run build && node --test dist/auth/metabaseSessions.test.js",
     "test:starrocks": "npm run build && node --test dist/connectors/starrocks.test.js",
+    "test:semantic": "npm run build && node --test dist/connectors/metabaseSemantic.test.js",
     "start": "node dist/server.js",
     "start:http": "node dist/http.js",
     "check": "tsc --noEmit -p tsconfig.json"

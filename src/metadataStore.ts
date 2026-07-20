@@ -94,8 +94,8 @@ export async function upsertPlatformAssets(platform: DataPlatform, assets: DataA
     await connection.query("begin");
     await connection.query(`update ${tableName} set is_active = false, updated_at = now() where platform = $1`, [platform]);
     for (const asset of uniqueAssets) {
-      const previousAssetId = getPreviousMetabaseAssetId(asset);
-      if (previousAssetId) {
+      const previousAssetIds = getPreviousMetabaseAssetIds(asset);
+      for (const previousAssetId of previousAssetIds) {
         await connection.query(
           `update ${tableName}
            set asset_id = $1, updated_at = now()
@@ -450,15 +450,13 @@ function dedupeAssets(assets: DataAsset[]): DataAsset[] {
   return Array.from(new Map(assets.map((asset) => [asset.id, asset])).values());
 }
 
-function getPreviousMetabaseAssetId(asset: DataAsset): string | undefined {
-  if (asset.platform !== "metabase") return undefined;
-  if (asset.type === "model" && asset.id.startsWith("metabase:model:")) {
-    return asset.id.replace("metabase:model:", "metabase:card:");
-  }
-  if (asset.type === "card" && asset.id.startsWith("metabase:card:")) {
-    return asset.id.replace("metabase:card:", "metabase:model:");
-  }
-  return undefined;
+function getPreviousMetabaseAssetIds(asset: DataAsset): string[] {
+  if (asset.platform !== "metabase") return [];
+  const match = /^metabase:(card|model|metric):(.+)$/.exec(asset.id);
+  if (!match) return [];
+  return ["card", "model", "metric"]
+    .filter((type) => type !== match[1])
+    .map((type) => `metabase:${type}:${match[2]}`);
 }
 
 function parseTimestamp(value: string | undefined): string | undefined {

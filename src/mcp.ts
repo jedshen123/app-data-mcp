@@ -44,7 +44,7 @@ export async function createAppDataMcpServer() {
 
   if (enabledTools.has("search_assets")) server.tool(
     "search_assets",
-    "Search published PostgreSQL metadata for Metabase dashboards/cards/models, PostHog insights, metrics, tables, and events.",
+    "Search published PostgreSQL metadata for Metabase dashboards, cards, models and metrics, plus PostHog insights, metrics, tables, and events.",
     {
       query: z.string().default("").describe("Keyword query, e.g. 新增用户, activation, retention."),
       platform: z.enum(["metabase", "posthog", "local"]).optional(),
@@ -76,7 +76,7 @@ export async function createAppDataMcpServer() {
           count: assets.length,
           note: "Results come from published PostgreSQL metadata and are filtered by access snapshots. Use get_asset, trace_asset, or run_asset with an id for details.",
           nextSteps: [
-            "If a curated Metabase/PostHog asset answers the question, prefer run_asset.",
+            "If a curated Metabase/PostHog asset answers the question, prefer run_asset. For Metabase metrics, inspect metric.formula, dataSource, defaultTimeDimension, dimensions, and dependencies before choosing breakdowns.",
             "For Metabase dashboards, inspect parameters and dashboardParameterMappings to decide whether filters can answer the user's question.",
             "If no curated asset matches or custom breakdowns are needed, use semantic tools when configured."
           ]
@@ -91,7 +91,7 @@ export async function createAppDataMcpServer() {
     {
       asset_id: z
         .string()
-        .describe("Unified asset id, e.g. metabase:card:456, metabase:model:388, or posthog:insight:activation-funnel.")
+        .describe("Unified asset id, e.g. metabase:card:456, metabase:model:388, metabase:metric:480, or posthog:insight:activation-funnel.")
     },
     async ({ asset_id }) => {
       const auditDetails: AuditDetails = { assetId: asset_id };
@@ -140,6 +140,7 @@ export async function createAppDataMcpServer() {
           asset: summarizeAsset(asset),
           queryText: asset.queryText,
           columns: asset.columns,
+          metric: asset.metric,
           sourceRefs: asset.sourceRefs ?? [],
           referencedAssets: filterAssetsBySnapshotAccess(
             referencedAssets.filter((ref) => ref !== undefined),
@@ -154,7 +155,7 @@ export async function createAppDataMcpServer() {
 
   if (enabledTools.has("run_asset")) server.tool(
     "run_asset",
-    "Return read-only live data for a supported Metabase/PostHog asset, with local sampleData fallback.",
+    "Return read-only live data for a supported Metabase/PostHog asset. Metabase Model and Metric assets support validated semantic filters, fields, aggregations, and breakouts.",
     {
       asset_id: z.string(),
       params: z
@@ -163,10 +164,29 @@ export async function createAppDataMcpServer() {
         .describe(
           "Optional read-only parameters. Prefer friendly names from asset.parameters, e.g. {date:'2026-07-01~2026-07-09', country:'US'}. Advanced Metabase users may pass native {parameters:[...]}."
         ),
+      semantic: z.object({
+        filters: z.array(z.object({
+          field: z.string().min(1),
+          operator: z.enum(["eq", "neq", "gt", "gte", "lt", "lte", "in", "not_in", "contains", "is_null", "not_null", "between"]),
+          value: z.unknown().optional()
+        }).strict()).max(20).optional(),
+        breakouts: z.array(z.object({
+          field: z.string().min(1),
+          unit: z.enum(["minute", "hour", "day", "week", "month", "quarter", "year"]).optional()
+        }).strict()).max(5).optional(),
+        fields: z.array(z.string().min(1)).max(50).optional(),
+        aggregations: z.array(z.object({
+          operator: z.enum(["count", "distinct", "sum", "avg", "min", "max"]),
+          field: z.string().min(1).optional(),
+          alias: z.string().min(1).max(100).optional()
+        }).strict()).max(10).optional()
+      }).strict().optional().describe(
+        "Validated semantic controls for Metabase Model/Metric only. Metric allows filters/breakouts while preserving its governed formula. Model allows filters/fields, or aggregations with optional breakouts. Use exact names from get_asset columns or metric.dimensions. Pass breakouts:[] to remove a Metric's default grouping."
+      ),
       limit: z.number().int().min(1).max(limits.maxResultRowLimit).default(limits.defaultResultRowLimit)
     },
-    async ({ asset_id, params, limit }) => {
-      const auditDetails: AuditDetails = { assetId: asset_id, params, limit };
+    async ({ asset_id, params, semantic, limit }) => {
+      const auditDetails: AuditDetails = { assetId: asset_id, params, limit, metadata: semantic ? { semantic } : undefined };
       return auditToolCall("run_asset", auditDetails, async () => {
         const authError = requireUserToken();
         if (authError) return authError;
@@ -190,16 +210,18 @@ export async function createAppDataMcpServer() {
 
         if (asset.platform === "metabase" || asset.platform === "posthog") {
           try {
-            const live = await runLiveAsset(asset, { params, limit });
+            const live = await runLiveAsset(asset, { params, semantic, limit });
             return toLimitedTextPayload({
               asset: summarizeAsset(asset),
               data: live.data,
               params: params ?? {},
+              semantic: semantic ?? undefined,
               live: true,
               source: live.source,
               warnings: live.warnings
             }, limits.maxResponseBytes);
           } catch (error) {
+            const errorMessage = error instanceof Error ? error.message : String(error);
             if (asset.platform === "metabase" && isReauthError(error)) {
               return toTextPayload({
                 asset: summarizeAsset(asset),
@@ -216,6 +238,18 @@ export async function createAppDataMcpServer() {
                 }
               });
             }
+            if (errorMessage.startsWith("semantic_")) {
+              return toTextPayload({
+                asset: summarizeAsset(asset),
+                data: null,
+                params: params ?? {},
+                semantic: semantic ?? undefined,
+                live: false,
+                error: "semantic_query_invalid",
+                message: errorMessage,
+                guidance: "Call get_asset and use exact field names from columns (Model) or metric.dimensions (Metric). Metric formulas are immutable; use only filters and breakouts for Metric assets."
+              });
+            }
             if (!asset.sampleData) {
               return toTextPayload({
                 asset: summarizeAsset(asset),
@@ -223,7 +257,7 @@ export async function createAppDataMcpServer() {
                 params: params ?? {},
                 live: false,
                 error: "live_connector_failed",
-                message: error instanceof Error ? error.message : String(error),
+                message: errorMessage,
                 loginUrl: isReauthError(error) ? getMetabaseLoginUrl() : undefined,
                 source: {
                   url: asset.url,

@@ -7,7 +7,9 @@ const columnSchema = z.object({
   name: z.string(),
   displayName: z.string().optional(),
   type: z.string(),
-  description: z.string().optional()
+  semanticType: z.string().optional(),
+  description: z.string().optional(),
+  fieldRef: z.unknown().optional()
 });
 
 const sourceRefSchema = z.object({
@@ -60,6 +62,27 @@ const dashboardParameterMappingSchema = z.object({
   raw: z.record(z.unknown()).optional()
 });
 
+const metricMetadataSchema = z.object({
+  formula: z.unknown().optional(),
+  filters: z.array(z.unknown()).optional(),
+  dataSource: z.object({
+    kind: z.enum(["table", "card", "model", "metric", "unknown"]),
+    id: z.string(),
+    assetId: z.string().optional(),
+    title: z.string().optional()
+  }).optional(),
+  defaultTimeDimension: z.object({
+    field: z.unknown(),
+    name: z.string().optional(),
+    displayName: z.string().optional(),
+    unit: z.string().optional()
+  }).optional(),
+  dimensions: z.array(columnSchema).optional(),
+  upstreamAssets: z.array(z.string()).optional(),
+  downstreamAssets: z.array(z.string()).optional(),
+  queryDescription: z.string().optional()
+});
+
 const assetSchema = z.object({
   id: z.string(),
   platform: z.enum(["metabase", "posthog", "local"]),
@@ -84,6 +107,7 @@ const assetSchema = z.object({
     .optional(),
   parameters: z.array(parameterSchema).optional(),
   dashboardParameterMappings: z.array(dashboardParameterMappingSchema).optional(),
+  metric: metricMetadataSchema.optional(),
   access: accessSnapshotSchema.optional(),
   warnings: z.array(z.string()).optional()
 });
@@ -187,7 +211,8 @@ export class CatalogStore {
             asset.parameters?.map((parameter) => `${parameter.name} ${parameter.label ?? ""} ${parameter.description ?? ""}`).join(" "),
             asset.dashboardParameterMappings
               ?.map((mapping) => `${mapping.parameterId} ${mapping.parameterName ?? ""} ${mapping.cardTitle ?? ""}`)
-              .join(" ")
+              .join(" "),
+            asset.metric ? JSON.stringify(asset.metric) : undefined
           ]
             .filter(Boolean)
             .join(" ")

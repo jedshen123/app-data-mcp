@@ -25,14 +25,20 @@ const LEGACY_USER_SESSION_MCP_SERVER_INSTRUCTIONS =
 const LEGACY_SERVICE_ACCOUNT_MCP_SERVER_INSTRUCTIONS =
   "这是一个只读的内部数据网关。对于已经治理的 Metabase/PostHog 数据，优先使用 search_assets 查找资产，并使用 run_asset 查询。只有当治理资产无法回答问题，或用户明确要求 SQL 时，才使用 query_starrocks。查询不熟悉的 StarRocks 表之前，先使用 SHOW/DESCRIBE 检查元信息，再生成有明确范围和行数限制的 SELECT。Metabase 默认使用服务端账号或 API Key，不要求用户维护个人 Metabase Session；如果连接失败，应提示检查服务端连接配置，不要描述为用户授权过期。不要在对话中索取或暴露密码、Session、API Key 等敏感信息。所有查询必须保持只读，并遵守返回行数限制。";
 
-export const DEFAULT_MCP_SERVER_INSTRUCTIONS =
+const LEGACY_PRE_METRIC_MCP_SERVER_INSTRUCTIONS =
   "这是一个只读的内部数据网关。对于已经治理的 Metabase/PostHog 数据，优先使用 search_assets 查找资产，并使用 run_asset 查询。只有当治理资产无法回答问题，或用户明确要求 SQL 时，才使用 query_starrocks。查询不熟悉的 StarRocks 表之前，先使用 SHOW/DESCRIBE 检查元信息，再生成有明确范围和行数限制的 SELECT。每个个人 MCP token 对应一个 Metabase 账号，所有 Metabase 查询必须使用该 token 对应账号的权限。MCP 不按本地时间主动判定用户授权过期；只有个人 token 缺失、无对应账号，或 Metabase 实际拒绝当前 Session 时，才提示用户重新授权。不要改用统一服务账号绕过用户权限，也不要在对话中索取或暴露密码、Session、API Key 等敏感信息。所有查询必须保持只读，并遵守返回行数限制。";
+
+const LEGACY_PRE_SEMANTIC_MCP_SERVER_INSTRUCTIONS =
+  "这是一个只读的内部数据网关。对于已经治理的 Metabase/PostHog 数据，优先使用 search_assets 查找资产，并使用 run_asset 查询。Metabase Metric 是经过治理的标准指标；找到 type=metric 的资产时，先通过 get_asset 查看 metric.formula、dataSource、defaultTimeDimension、dimensions 和上下游依赖，再运行该指标或选择合适的拆分维度。只有当治理资产无法回答问题，或用户明确要求 SQL 时，才使用 query_starrocks。查询不熟悉的 StarRocks 表之前，先使用 SHOW/DESCRIBE 检查元信息，再生成有明确范围和行数限制的 SELECT。每个个人 MCP token 对应一个 Metabase 账号，所有 Metabase 查询必须使用该 token 对应账号的权限。MCP 不按本地时间主动判定用户授权过期；只有个人 token 缺失、无对应账号，或 Metabase 实际拒绝当前 Session 时，才提示用户重新授权。不要改用统一服务账号绕过用户权限，也不要在对话中索取或暴露密码、Session、API Key 等敏感信息。所有查询必须保持只读，并遵守返回行数限制。";
+
+export const DEFAULT_MCP_SERVER_INSTRUCTIONS =
+  "这是一个只读的内部数据网关。对于已经治理的 Metabase/PostHog 数据，优先使用 search_assets 查找资产，并使用 run_asset 查询。Metabase Metric 是经过治理的标准指标：先用 get_asset 查看 metric.formula、dataSource、defaultTimeDimension 和 dimensions，再通过 run_asset.semantic.filters/breakouts 动态筛选或拆分，绝不能替换 Metric 公式。Metabase Model 是受控语义明细层：先查看 columns，再通过 run_asset.semantic.fields 获取指定明细字段，或者通过 semantic.aggregations 配合 breakouts 进行动态聚合。字段必须使用元信息中存在的名称；不要臆造字段。只有治理资产无法回答问题，或用户明确要求 SQL 时，才使用 query_starrocks。查询不熟悉的 StarRocks 表之前，先使用 SHOW/DESCRIBE 检查元信息，再生成有明确范围和行数限制的 SELECT。每个个人 MCP token 对应一个 Metabase 账号，所有 Metabase 查询必须使用该 token 对应账号的权限。MCP 不按本地时间主动判定用户授权过期；只有个人 token 缺失、无对应账号，或 Metabase 实际拒绝当前 Session 时，才提示用户重新授权。不要改用统一服务账号绕过用户权限，也不要在对话中索取或暴露密码、Session、API Key 等敏感信息。所有查询必须保持只读，并遵守返回行数限制。";
 
 export const MCP_TOOL_DEFINITIONS = [
   { name: "search_assets", title: "搜索数据资产", category: "资产发现", riskLevel: "low", description: "搜索已开放的 Metabase、PostHog 和本地元信息，支持平台、类型和业务域过滤。", usageNotes: "通常作为数据分析的第一步。找到合适资产后，再调用 get_asset、trace_asset 或 run_asset。", inputSchema: { query: "string，关键词，默认空字符串", platform: "metabase | posthog | local，可选", type: "dashboard | card | model | insight | metric | table | event，可选", domain: "string，业务域，可选", limit: "integer，返回数量" } },
-  { name: "get_asset", title: "查看资产详情", category: "元信息", riskLevel: "low", description: "读取单个资产的完整元信息，包括链接、查询定义、字段、参数和警告。", usageNotes: "需要先通过 search_assets 获得统一资产 ID；Metabase 资产会使用个人 MCP token 对应账号实时校验权限。", inputSchema: { asset_id: "string，必填，例如 metabase:card:456 或 metabase:model:388" } },
+  { name: "get_asset", title: "查看资产详情", category: "元信息", riskLevel: "low", description: "读取单个资产的完整元信息，包括链接、查询定义、字段、参数、Metric 公式/维度/依赖和警告。", usageNotes: "需要先通过 search_assets 获得统一资产 ID；Metabase 资产会使用个人 MCP token 对应账号实时校验权限。", inputSchema: { asset_id: "string，必填，例如 metabase:card:456、metabase:model:388 或 metabase:metric:480" } },
   { name: "trace_asset", title: "追踪资产来源", category: "元信息", riskLevel: "low", description: "查看资产的查询定义、字段、上游来源、引用资产和原始平台链接。", usageNotes: "用于解释数据出处、SQL、字段和上游依赖，不执行数据查询。", inputSchema: { asset_id: "string，必填" } },
-  { name: "run_asset", title: "运行数据资产", category: "数据查询", riskLevel: "medium", description: "使用个人 MCP token 对应的 Metabase 账号权限运行 Card、Model、Dashboard，或运行 PostHog Insight，并限制返回行数。", usageNotes: "优先运行已治理资产。Metabase 调用按 token 对应账号鉴权；参数应来自资产 parameters。", inputSchema: { asset_id: "string，必填", params: "object，可选，友好参数或平台原生参数", limit: "integer，返回行数限制" } },
+  { name: "run_asset", title: "运行数据资产", category: "数据查询", riskLevel: "medium", description: "使用个人 MCP token 对应的 Metabase 账号权限运行 Card、Model、Metric、Dashboard，或运行 PostHog Insight；Model/Metric 支持受控语义查询。", usageNotes: "Metric 只允许 semantic.filters 和 semantic.breakouts，保持治理公式不变；Model 可用 semantic.fields 查询明细，或使用 semantic.aggregations 配合 breakouts 聚合。字段必须来自 get_asset 元信息。", inputSchema: { asset_id: "string，必填", params: "object，可选，友好参数或平台原生参数，不能与 semantic 同用", semantic: "object，可选，仅 Metabase Model/Metric；包含 filters、breakouts、fields、aggregations", limit: "integer，返回行数限制" } },
   { name: "query_starrocks", title: "查询 StarRocks", category: "数据查询", riskLevel: "high", description: "执行受控的只读 StarRocks SQL，允许 SELECT、WITH、SHOW、DESCRIBE 和 EXPLAIN。", usageNotes: "仅在治理资产不能回答问题或用户明确要求 SQL 时使用；陌生表应先 SHOW/DESCRIBE。", inputSchema: { sql: "string，必填，单条只读 SQL", limit: "integer，返回行数限制" } },
   { name: "list_domains", title: "列出业务域", category: "资产发现", riskLevel: "low", description: "列出当前用户可见的已开放资产业务域。", usageNotes: "可用于帮助 AI 缩小 search_assets 的 domain 范围。", inputSchema: {} },
   { name: "catalog_status", title: "查看目录状态", category: "运行状态", riskLevel: "low", description: "查看已开放元信息数量、平台和类型统计以及同步新鲜度。", usageNotes: "用于排查搜索不到资产、同步过期或目录未初始化问题。", inputSchema: {} },
@@ -217,7 +223,7 @@ async function initializeToolTable(): Promise<void> {
       `update ${settingsTableName}
        set setting_value = $1, updated_at = now(), updated_by = 'system-default-migration'
        where setting_key = 'global_instructions' and setting_value = any($2::text[])`,
-      [DEFAULT_MCP_SERVER_INSTRUCTIONS, [LEGACY_ENGLISH_MCP_SERVER_INSTRUCTIONS, LEGACY_USER_SESSION_MCP_SERVER_INSTRUCTIONS, LEGACY_SERVICE_ACCOUNT_MCP_SERVER_INSTRUCTIONS]]
+      [DEFAULT_MCP_SERVER_INSTRUCTIONS, [LEGACY_ENGLISH_MCP_SERVER_INSTRUCTIONS, LEGACY_USER_SESSION_MCP_SERVER_INSTRUCTIONS, LEGACY_SERVICE_ACCOUNT_MCP_SERVER_INSTRUCTIONS, LEGACY_PRE_METRIC_MCP_SERVER_INSTRUCTIONS, LEGACY_PRE_SEMANTIC_MCP_SERVER_INSTRUCTIONS]]
     );
     for (const tool of MCP_TOOL_DEFINITIONS) {
       await connection.query(

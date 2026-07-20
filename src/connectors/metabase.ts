@@ -1,8 +1,18 @@
+import { randomUUID } from "node:crypto";
 import { getAuthConfig, getMetabaseConfig } from "../config.js";
 import { getMetabaseLoginUrl } from "../auth/loginRoutes.js";
 import { getStoredMetabaseSession } from "../auth/metabaseSessions.js";
 import { getRequestContext } from "../requestContext.js";
-import type { AssetParameter, ColumnMeta, DashboardParameterMapping, DataAsset } from "../types.js";
+import type {
+  AssetParameter,
+  ColumnMeta,
+  DashboardParameterMapping,
+  DataAsset,
+  SemanticAggregation,
+  SemanticBreakout,
+  SemanticFilter,
+  SemanticQuery
+} from "../types.js";
 import { fetchJson, getNumber, getObject, getString, isObject, joinUrl } from "../sync/http.js";
 
 type MetabaseClient = {
@@ -12,6 +22,7 @@ type MetabaseClient = {
 
 type RunOptions = {
   params?: Record<string, unknown>;
+  semantic?: SemanticQuery;
   limit: number;
 };
 
@@ -25,20 +36,32 @@ type NormalizedResult = {
 };
 
 export async function runMetabaseAsset(asset: DataAsset, options: RunOptions) {
+  if (options.semantic && (asset.type !== "model" && asset.type !== "metric")) {
+    throw new Error(`semantic_query_not_supported: Dynamic semantic queries require a Metabase Model or Metric, got ${asset.type}.`);
+  }
   const client = await createMetabaseClient();
-  if (asset.type === "card" || asset.type === "model") {
+  if (asset.type === "card" || asset.type === "model" || asset.type === "metric") {
     const cardId = getAssetNumericId(asset.id);
-    const result = await runMetabaseCard(client, cardId, asset.parameters, options);
+    const semanticQuery = options.semantic;
+    if (semanticQuery && options.params && Object.keys(options.params).length > 0) {
+      throw new Error("semantic_query_params_conflict: Use semantic.filters for a dynamic Model/Metric query; params cannot be combined with semantic controls.");
+    }
+    const result = semanticQuery
+      ? await runMetabaseSemanticQuery(client, asset, semanticQuery, options.limit)
+      : await runMetabaseCard(client, cardId, asset.parameters, options);
     return {
       data: result,
       source: {
         url: asset.url,
         queryText: asset.queryText,
-        sourceRefs: asset.sourceRefs ?? []
+        sourceRefs: asset.sourceRefs ?? [],
+        semanticQuery: semanticQuery ?? undefined
       },
       warnings: [
         ...(asset.warnings ?? []),
-        "Live data returned from Metabase using a read-only card query endpoint.",
+        semanticQuery
+          ? `Live ${asset.type} data returned from a validated read-only semantic query.`
+          : `Live ${asset.type} data returned from Metabase using a read-only card query endpoint.`,
         ...(result.truncated ? [`Result truncated to ${options.limit} rows.`] : [])
       ]
     };
@@ -61,7 +84,228 @@ export async function runMetabaseAsset(asset: DataAsset, options: RunOptions) {
     };
   }
 
-  throw new Error(`Metabase execution is only supported for card and dashboard assets, got ${asset.type}.`);
+  throw new Error(`Metabase execution is only supported for card, model, metric, and dashboard assets, got ${asset.type}.`);
+}
+
+async function runMetabaseSemanticQuery(
+  client: MetabaseClient,
+  asset: DataAsset,
+  semantic: SemanticQuery,
+  limit: number
+): Promise<NormalizedResult> {
+  const query = buildMetabaseSemanticQuery(asset, semantic, limit);
+  const value = await fetchJson<unknown>(joinUrl(client.baseUrl, "/api/dataset"), {
+    method: "POST",
+    headers: {
+      ...client.headers,
+      "content-type": "application/json"
+    },
+    body: JSON.stringify(query)
+  });
+  return normalizeDatasetResponse(value, limit);
+}
+
+export function buildMetabaseSemanticQuery(asset: DataAsset, semantic: SemanticQuery, limit: number): Record<string, unknown> {
+  if (asset.platform !== "metabase" || (asset.type !== "model" && asset.type !== "metric")) {
+    throw new Error(`semantic_query_not_supported: Expected a Metabase Model or Metric, got ${asset.platform}:${asset.type}.`);
+  }
+  if (!Number.isInteger(limit) || limit < 1) throw new Error("semantic_query_invalid_limit: limit must be a positive integer.");
+  validateSemanticQueryShape(semantic);
+  const availableDimensions = asset.type === "metric" ? asset.metric?.dimensions ?? [] : asset.columns ?? [];
+  if (!availableDimensions.length) {
+    throw new Error("semantic_metadata_missing: No synchronized dimensions are available. Run npm run sync:metabase before using semantic controls.");
+  }
+
+  if (asset.type === "metric") {
+    if (semantic.fields !== undefined || semantic.aggregations !== undefined) {
+      throw new Error("semantic_metric_formula_immutable: Metric formulas are governed; fields and aggregations cannot replace them. Use filters and breakouts only.");
+    }
+    const query = readStoredDatasetQuery(asset);
+    const stages = readQueryStages(query);
+    const definitionStage = [...stages].reverse().find((stage) => Array.isArray(stage.aggregation)) ?? stages.at(-1);
+    if (!definitionStage) throw new Error("semantic_query_invalid_metric: Metric query has no MBQL stage.");
+    appendSemanticFilters(definitionStage, semantic.filters, availableDimensions);
+    if (semantic.breakouts !== undefined) {
+      definitionStage.breakout = semantic.breakouts.map((breakout) => buildBreakout(breakout, availableDimensions));
+    }
+    definitionStage.limit = limit;
+    return query;
+  }
+
+  const storedQuery = readStoredDatasetQuery(asset);
+  const database = getNumber(storedQuery.database);
+  if (database === undefined) throw new Error("semantic_query_invalid_model: Model query does not declare a database id.");
+  const stage: Record<string, unknown> = {
+    "lib/type": "mbql.stage/mbql",
+    "source-card": Number(getAssetNumericId(asset.id)),
+    limit
+  };
+  appendSemanticFilters(stage, semantic.filters, availableDimensions);
+
+  const aggregations = semantic.aggregations ?? [];
+  const breakouts = semantic.breakouts ?? [];
+  if (breakouts.length && !aggregations.length) {
+    throw new Error("semantic_model_aggregation_required: Model breakouts require at least one aggregation.");
+  }
+  if (aggregations.length) {
+    if (semantic.fields?.length) throw new Error("semantic_model_fields_conflict: fields cannot be combined with aggregations.");
+    stage.aggregation = aggregations.map((aggregation) => buildAggregation(aggregation, availableDimensions));
+    if (breakouts.length) stage.breakout = breakouts.map((breakout) => buildBreakout(breakout, availableDimensions));
+  } else if (semantic.fields !== undefined) {
+    stage.fields = semantic.fields.map((field) => buildFieldRef(resolveDimension(field, availableDimensions)));
+  }
+
+  return {
+    "lib/type": "mbql/query",
+    database,
+    stages: [stage]
+  };
+}
+
+function readStoredDatasetQuery(asset: DataAsset): Record<string, unknown> {
+  if (!asset.queryText) throw new Error("semantic_query_definition_missing: Asset has no synchronized Metabase query definition.");
+  try {
+    const parsed = JSON.parse(asset.queryText);
+    if (!isObject(parsed)) throw new Error("not an object");
+    return structuredClone(parsed);
+  } catch (error) {
+    throw new Error(`semantic_query_definition_invalid: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function readQueryStages(query: Record<string, unknown>): Record<string, unknown>[] {
+  return Array.isArray(query.stages) ? query.stages.filter(isObject) : [];
+}
+
+function validateSemanticQueryShape(semantic: SemanticQuery): void {
+  if (Buffer.byteLength(JSON.stringify(semantic), "utf8") > 65_536) throw new Error("semantic_query_too_large: maximum 65536 bytes.");
+  if ((semantic.filters?.length ?? 0) > 20) throw new Error("semantic_query_too_many_filters: maximum 20.");
+  if ((semantic.breakouts?.length ?? 0) > 5) throw new Error("semantic_query_too_many_breakouts: maximum 5.");
+  if ((semantic.fields?.length ?? 0) > 50) throw new Error("semantic_query_too_many_fields: maximum 50.");
+  if ((semantic.aggregations?.length ?? 0) > 10) throw new Error("semantic_query_too_many_aggregations: maximum 10.");
+  if (semantic.fields !== undefined && semantic.fields.length === 0) throw new Error("semantic_query_empty_fields: fields must contain at least one field when provided.");
+  if (semantic.aggregations !== undefined && semantic.aggregations.length === 0) throw new Error("semantic_query_empty_aggregations: aggregations must contain at least one aggregation when provided.");
+}
+
+function appendSemanticFilters(
+  stage: Record<string, unknown>,
+  filters: SemanticFilter[] | undefined,
+  dimensions: ColumnMeta[]
+): void {
+  if (!filters?.length) return;
+  const existing = Array.isArray(stage.filters) ? stage.filters : [];
+  stage.filters = [...existing, ...filters.map((filter) => buildFilter(filter, dimensions))];
+}
+
+function buildFilter(filter: SemanticFilter, dimensions: ColumnMeta[]): unknown {
+  const dimension = resolveDimension(filter.field, dimensions);
+  const fieldRef = buildFieldRef(dimension);
+  const options = { "lib/uuid": randomUUID() };
+  switch (filter.operator) {
+    case "eq": return ["=", options, fieldRef, requireScalarValue(filter)];
+    case "neq": return ["!=", options, fieldRef, requireScalarValue(filter)];
+    case "gt": return [">", options, fieldRef, requireScalarValue(filter)];
+    case "gte": return [">=", options, fieldRef, requireScalarValue(filter)];
+    case "lt": return ["<", options, fieldRef, requireScalarValue(filter)];
+    case "lte": return ["<=", options, fieldRef, requireScalarValue(filter)];
+    case "contains": {
+      if (typeof filter.value !== "string" || !filter.value.length) throw new Error(`semantic_filter_invalid_value: contains requires a non-empty string for ${filter.field}.`);
+      return ["contains", options, fieldRef, filter.value];
+    }
+    case "is_null": return ["is-null", options, fieldRef];
+    case "not_null": return ["not-null", options, fieldRef];
+    case "in":
+    case "not_in": {
+      if (!Array.isArray(filter.value) || filter.value.length === 0 || filter.value.length > 100) {
+        throw new Error(`semantic_filter_invalid_value: ${filter.operator} requires 1-100 values for ${filter.field}.`);
+      }
+      if (!filter.value.every(isSemanticScalar)) throw new Error(`semantic_filter_invalid_value: ${filter.operator} values must be scalar for ${filter.field}.`);
+      return [filter.operator === "in" ? "=" : "!=", options, fieldRef, ...filter.value];
+    }
+    case "between": {
+      if (!Array.isArray(filter.value) || filter.value.length !== 2) {
+        throw new Error(`semantic_filter_invalid_value: between requires [from, to] for ${filter.field}.`);
+      }
+      if (!filter.value.every(isSemanticScalar)) throw new Error(`semantic_filter_invalid_value: between values must be scalar for ${filter.field}.`);
+      return ["between", options, fieldRef, filter.value[0], filter.value[1]];
+    }
+    default: throw new Error(`semantic_filter_invalid_operator: ${String(filter.operator)}.`);
+  }
+}
+
+function requireScalarValue(filter: SemanticFilter): unknown {
+  if (!isSemanticScalar(filter.value)) {
+    throw new Error(`semantic_filter_invalid_value: ${filter.operator} requires a scalar value for ${filter.field}.`);
+  }
+  return filter.value;
+}
+
+function isSemanticScalar(value: unknown): value is string | number | boolean {
+  return typeof value === "string" || (typeof value === "number" && Number.isFinite(value)) || typeof value === "boolean";
+}
+
+function buildBreakout(breakout: SemanticBreakout, dimensions: ColumnMeta[]): unknown {
+  const dimension = resolveDimension(breakout.field, dimensions);
+  if (breakout.unit && !["minute", "hour", "day", "week", "month", "quarter", "year"].includes(breakout.unit)) {
+    throw new Error(`semantic_breakout_invalid_unit: ${breakout.unit}.`);
+  }
+  if (breakout.unit && !isTemporalDimension(dimension)) {
+    throw new Error(`semantic_breakout_invalid_unit: ${breakout.field} is not a temporal field.`);
+  }
+  return buildFieldRef(dimension, breakout.unit);
+}
+
+function buildAggregation(aggregation: SemanticAggregation, dimensions: ColumnMeta[]): unknown {
+  const options: Record<string, unknown> = { "lib/uuid": randomUUID() };
+  if (aggregation.alias) options.name = aggregation.alias;
+  if (aggregation.operator === "count") {
+    if (aggregation.field) throw new Error("semantic_aggregation_invalid: count must not declare field; use distinct for a field count.");
+    return ["count", options];
+  }
+  if (!aggregation.field) throw new Error(`semantic_aggregation_invalid: ${aggregation.operator} requires field.`);
+  const dimension = resolveDimension(aggregation.field, dimensions);
+  if (["sum", "avg"].includes(aggregation.operator) && !isNumericDimension(dimension)) {
+    throw new Error(`semantic_aggregation_invalid: ${aggregation.operator} requires a numeric field, got ${aggregation.field}.`);
+  }
+  return [aggregation.operator, options, buildFieldRef(dimension)];
+}
+
+function resolveDimension(requested: string, dimensions: ColumnMeta[]): ColumnMeta {
+  const normalized = normalizeFieldName(requested);
+  const matches = dimensions.filter((dimension) =>
+    normalizeFieldName(dimension.name) === normalized || normalizeFieldName(dimension.displayName) === normalized
+  );
+  if (matches.length === 0) {
+    throw new Error(`semantic_field_not_found: ${requested}. Available fields: ${dimensions.slice(0, 50).map((dimension) => dimension.name).join(", ")}`);
+  }
+  if (matches.length > 1) throw new Error(`semantic_field_ambiguous: ${requested}. Use the exact field name.`);
+  if (!matches[0].fieldRef) throw new Error(`semantic_field_reference_missing: ${requested}. Run npm run sync:metabase.`);
+  return matches[0];
+}
+
+function buildFieldRef(dimension: ColumnMeta, temporalUnit?: string): unknown {
+  const ref = structuredClone(dimension.fieldRef);
+  if (!Array.isArray(ref) || ref[0] !== "field") throw new Error(`semantic_field_reference_invalid: ${dimension.name}.`);
+  const options = isObject(ref[1]) ? ref[1] : {};
+  ref[1] = {
+    ...options,
+    "base-type": getString(options["base-type"]) ?? dimension.type,
+    ...(temporalUnit ? { "temporal-unit": temporalUnit } : {}),
+    "lib/uuid": randomUUID()
+  };
+  return ref;
+}
+
+function normalizeFieldName(value: string | undefined): string {
+  return (value ?? "").trim().toLocaleLowerCase();
+}
+
+function isTemporalDimension(dimension: ColumnMeta): boolean {
+  return /date|time/i.test(`${dimension.type} ${dimension.semanticType ?? ""}`);
+}
+
+function isNumericDimension(dimension: ColumnMeta): boolean {
+  return /integer|float|decimal|number|bigint/i.test(dimension.type);
 }
 
 async function createMetabaseClient(): Promise<MetabaseClient> {
@@ -381,7 +625,9 @@ function normalizeDatasetResponse(value: unknown, limit: number): NormalizedResu
   const rawRows = Array.isArray(data?.rows) ? data.rows : [];
   const columns = cols.map((col, index) => ({
     name: getString(col.name) ?? getString(col.display_name) ?? `col_${index + 1}`,
+    displayName: getString(col.display_name),
     type: getString(col.base_type) ?? getString(col.semantic_type) ?? "unknown",
+    semanticType: getString(col.semantic_type),
     description: getString(col.description) ?? getString(col.display_name)
   }));
 
@@ -397,13 +643,14 @@ function normalizeDatasetResponse(value: unknown, limit: number): NormalizedResu
 }
 
 function rowToObject(row: unknown, columns: ColumnMeta[]): Record<string, unknown> {
+  if (Array.isArray(row)) {
+    return row.reduce<Record<string, unknown>>((record, value, index) => {
+      record[columns[index]?.name ?? `col_${index + 1}`] = value;
+      return record;
+    }, {});
+  }
   if (isObject(row)) return row;
-  if (!Array.isArray(row)) return { value: row };
-
-  return row.reduce<Record<string, unknown>>((record, value, index) => {
-    record[columns[index]?.name ?? `col_${index + 1}`] = value;
-    return record;
-  }, {});
+  return { value: row };
 }
 
 function inferColumns(rows: Record<string, unknown>[]): ColumnMeta[] {

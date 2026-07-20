@@ -26,6 +26,23 @@ export function summarizeAsset(asset: DataAsset) {
           byParameter: summarizeDashboardParameterMappings(asset)
         }
       : undefined,
+    metric: asset.metric ? {
+      formula: asset.metric.formula,
+      filters: asset.metric.filters,
+      dataSource: asset.metric.dataSource,
+      defaultTimeDimension: asset.metric.defaultTimeDimension,
+      dimensionCount: asset.metric.dimensions?.length ?? 0,
+      dimensions: asset.metric.dimensions?.slice(0, 20).map((dimension) => ({
+        name: dimension.name,
+        displayName: dimension.displayName,
+        type: dimension.type,
+        description: dimension.description
+      })),
+      dimensionsTruncated: (asset.metric.dimensions?.length ?? 0) > 20,
+      upstreamAssets: asset.metric.upstreamAssets,
+      downstreamAssets: asset.metric.downstreamAssets,
+      queryDescription: asset.metric.queryDescription
+    } : undefined,
     access: asset.access
       ? {
           visibility: asset.access.visibility,
