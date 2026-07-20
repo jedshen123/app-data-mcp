@@ -8,7 +8,7 @@
 - `get_asset`: 查看单个资产完整元信息。
 - `trace_asset`: 查看资产的 SQL / 事件 / 上游表 / 原始链接。
 - `run_asset`: 只读返回支持资产的真实数据；不支持时读取本地 `sampleData` 兜底。
-- `query_starrocks`: 执行 AI 生成的单条 StarRocks 只读 SQL，支持先查看表结构再查询数据。
+- `query_starrocks`: 治理资产无法回答后的受控 StarRocks SQL 回退；执行前会再次搜索 Metric/Model/Card。
 - `list_domains`: 查看配置里已有的业务域。
 - `auth_status`: 查看当前请求用户和 Metabase 授权状态。
 - `catalog_status`: 查看 PostgreSQL 中已开放元信息的数量和分类统计。
@@ -152,6 +152,36 @@ Model 可以选择明细字段：
 
 筛选操作符包括 `eq`、`neq`、`gt`、`gte`、`lt`、`lte`、`in`、`not_in`、`contains`、`is_null`、`not_null`、`between`；聚合包括 `count`、`distinct`、`sum`、`avg`、`min`、`max`。语义查询与 `params` 不能同时使用，Card、Dashboard 和 PostHog Insight 不接受 `semantic`。
 
+### 治理资产优先与 SQL 回退
+
+普通数据问题必须先调用 `search_assets`。搜索支持直接传入中文长句，会拆分中文二元/三元语义片段，并优先排序 Metric、Model，再考虑 Card。只有管理后台已开放且有效的资产会参与搜索和 SQL 治理检查。
+
+`query_starrocks` 要求同时传入用户原始问题，并在执行 SQL 前由服务端再次搜索治理资产：
+
+```json
+{
+  "question": "最近15天有效绑定M9设备的社区活跃用户数趋势",
+  "sql": "select ...",
+  "purpose": "data_question",
+  "limit": 100
+}
+```
+
+如果存在匹配的 Metric/Model/Card，服务端返回 `governed_assets_available`、候选资产和下一步说明，且 `sqlExecuted=false`。AI 应先使用 `get_asset` 和 `run_asset`。检查后确认候选资产不适用，才可显式拒绝并回退：
+
+```json
+{
+  "question": "最近15天有效绑定M9设备的社区活跃用户数趋势",
+  "sql": "select ...",
+  "purpose": "data_question",
+  "rejected_asset_ids": ["metabase:metric:480", "metabase:model:479"],
+  "fallback_reason": "候选资产没有所需的实验组字段",
+  "limit": 100
+}
+```
+
+`purpose=user_requested_sql` 只能用于用户明确要求直接执行 SQL 的场景；`purpose=metadata_inspection` 只允许 `SHOW`、`DESCRIBE/DESC` 和 `EXPLAIN`。
+
 Metabase dashboard 参数执行结果会包含筛选器覆盖情况：
 
 ```json
@@ -224,18 +254,21 @@ PostHog insight 支持常见只读覆盖参数：
 
 ## StarRocks 自助 SQL
 
-`query_starrocks` 用于 AI 助手生成 SQL 后查询数仓。推荐让 AI 按下面的顺序工作：
+`query_starrocks` 仅用于治理资产无法回答问题后的 SQL 回退。服务端强制执行下面的顺序：
 
-1. 优先调用 `search_assets`，能由已有 Metabase/PostHog 看板或卡片回答时使用 `run_asset`。
-2. 没有现成资产、用户明确要求 SQL 或需要自定义维度时，再使用 `query_starrocks`。
-3. 不熟悉表结构时，先执行 `SHOW TABLES`、`DESCRIBE table_name` 或 `SHOW CREATE TABLE table_name`。
-4. 根据真实字段生成带明确日期范围和过滤条件的 `SELECT`，避免扫描无关数据。
+1. 必须先调用 `search_assets`，优先检查 Metric、Model，再检查 Card、Dashboard 或 Insight。
+2. 能由治理资产回答时使用 `get_asset` 和 `run_asset`。
+3. 没有合适资产、已明确拒绝候选资产，或用户明确要求 SQL 时，才使用 `query_starrocks`。
+4. 不熟悉表结构时，先执行 `SHOW TABLES`、`DESCRIBE table_name` 或 `SHOW CREATE TABLE table_name`。
+5. 根据真实字段生成带明确日期范围和过滤条件的 `SELECT`，避免扫描无关数据。
 
 示例：
 
 ```json
 {
+  "question": "最近15天活跃用户数趋势",
   "sql": "SELECT dt, count(*) AS active_users FROM ads_app_daily WHERE dt >= '2026-07-01' GROUP BY dt ORDER BY dt",
+  "purpose": "data_question",
   "limit": 100
 }
 ```

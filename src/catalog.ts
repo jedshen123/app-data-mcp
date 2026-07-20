@@ -186,45 +186,26 @@ export class CatalogStore {
 
   async search(input: SearchAssetsInput): Promise<DataAsset[]> {
     const catalog = await this.getCatalog();
-    const query = normalize(input.query);
-    const terms = query.split(/\s+/).filter(Boolean);
     const limits = getDataLimitConfig();
     const limit = Math.min(Math.max(input.limit ?? limits.defaultSearchLimit, 1), limits.maxSearchLimit);
-
-    return catalog.assets
-      .filter((asset) => {
-        if (input.platform && asset.platform !== input.platform) return false;
-        if (input.type && asset.type !== input.type) return false;
-        if (input.domain && asset.businessDomain !== input.domain) return false;
-        if (terms.length === 0) return true;
-
-        const haystack = normalize(
-          [
-            asset.id,
-            asset.title,
-            asset.description,
-            asset.businessDomain,
-            asset.owner,
-            asset.tags.join(" "),
-            asset.queryText,
-            asset.columns?.map((column) => `${column.name} ${column.displayName ?? ""} ${column.description ?? ""}`).join(" "),
-            asset.parameters?.map((parameter) => `${parameter.name} ${parameter.label ?? ""} ${parameter.description ?? ""}`).join(" "),
-            asset.dashboardParameterMappings
-              ?.map((mapping) => `${mapping.parameterId} ${mapping.parameterName ?? ""} ${mapping.cardTitle ?? ""}`)
-              .join(" "),
-            asset.metric ? JSON.stringify(asset.metric) : undefined
-          ]
-            .filter(Boolean)
-            .join(" ")
-        );
-
-        return terms.every((term) => haystack.includes(term));
-      })
-      .map((asset) => ({ asset, score: scoreAsset(asset, terms) }))
-      .sort((left, right) => right.score - left.score)
-      .slice(0, limit)
-      .map(({ asset }) => asset);
+    return searchCatalogAssets(catalog.assets, input, limit);
   }
+}
+
+export function searchCatalogAssets(assets: DataAsset[], input: SearchAssetsInput, limit: number): DataAsset[] {
+  const signals = buildSearchSignals(input.query);
+  return assets
+    .filter((asset) => {
+      if (input.platform && asset.platform !== input.platform) return false;
+      if (input.type && asset.type !== input.type) return false;
+      if (input.domain && asset.businessDomain !== input.domain) return false;
+      return true;
+    })
+    .map((asset) => ({ asset, score: scoreAsset(asset, signals) }))
+    .filter(({ score }) => signals.tokens.length === 0 || score > 0)
+    .sort((left, right) => right.score - left.score || left.asset.title.localeCompare(right.asset.title, "zh-CN"))
+    .slice(0, limit)
+    .map(({ asset }) => asset);
 }
 
 function countBy<T>(items: T[], getKey: (item: T) => string): Record<string, number> {
@@ -239,22 +220,66 @@ function normalize(value: string | undefined): string {
   return (value ?? "").toLowerCase().trim();
 }
 
-function scoreAsset(asset: DataAsset, terms: string[]): number {
+type SearchSignals = {
+  normalizedQuery: string;
+  tokens: string[];
+};
+
+const SEARCH_STOP_TOKENS = new Set([
+  "帮我", "请使", "使用", "查询", "数据", "一下", "最近", "进行", "统计", "趋势", "相关", "看看"
+]);
+
+function buildSearchSignals(query: string): SearchSignals {
+  const normalizedQuery = normalize(query).replace(/[^a-z0-9_\u3400-\u9fff]+/g, " ");
+  const tokens = new Set<string>();
+  for (const ascii of normalizedQuery.match(/[a-z0-9_]+/g) ?? []) {
+    if (ascii.length >= 2) tokens.add(ascii);
+  }
+  for (const sequence of normalizedQuery.match(/[\u3400-\u9fff]+/g) ?? []) {
+    if (sequence.length <= 4 && !SEARCH_STOP_TOKENS.has(sequence)) tokens.add(sequence);
+    for (const size of [2, 3]) {
+      for (let index = 0; index <= sequence.length - size; index += 1) {
+        const token = sequence.slice(index, index + size);
+        if (!SEARCH_STOP_TOKENS.has(token)) tokens.add(token);
+      }
+    }
+  }
+  return { normalizedQuery: normalizedQuery.trim(), tokens: Array.from(tokens) };
+}
+
+function scoreAsset(asset: DataAsset, signals: SearchSignals): number {
   const popularity = asset.popularity ?? 0;
-  if (terms.length === 0) return popularity;
+  if (signals.tokens.length === 0) return popularity;
 
   const title = normalize(asset.title);
   const tags = normalize(asset.tags.join(" "));
   const description = normalize(asset.description);
+  const domain = normalize(asset.businessDomain);
   const queryText = normalize(asset.queryText);
-
-  return terms.reduce((score, term) => {
-    if (title.includes(term)) score += 20;
-    if (tags.includes(term)) score += 12;
-    if (description.includes(term)) score += 8;
-    if (queryText.includes(term)) score += 4;
-    return score;
-  }, popularity / 10);
+  const fields = normalize([
+    asset.columns?.map((column) => `${column.name} ${column.displayName ?? ""} ${column.description ?? ""}`).join(" "),
+    asset.metric?.dimensions?.map((column) => `${column.name} ${column.displayName ?? ""} ${column.description ?? ""}`).join(" "),
+    asset.metric?.queryDescription
+  ].filter(Boolean).join(" "));
+  let matchedTokens = 0;
+  let score = popularity / 10;
+  if (signals.normalizedQuery && `${title} ${description}`.includes(signals.normalizedQuery)) score += 80;
+  for (const token of signals.tokens) {
+    let matched = false;
+    if (title.includes(token)) { score += 20; matched = true; }
+    if (tags.includes(token)) { score += 12; matched = true; }
+    if (description.includes(token)) { score += 10; matched = true; }
+    if (domain.includes(token)) { score += 8; matched = true; }
+    if (fields.includes(token)) { score += 5; matched = true; }
+    if (queryText.includes(token)) { score += 2; matched = true; }
+    if (matched) matchedTokens += 1;
+  }
+  const minimumMatches = signals.tokens.length <= 2 ? 1 : 2;
+  if (matchedTokens < minimumMatches) return 0;
+  if (asset.type === "metric") score += 18;
+  else if (asset.type === "model") score += 10;
+  else if (asset.type === "card") score += 4;
+  return score + (matchedTokens / signals.tokens.length) * 20;
 }
 
 function rewriteCatalogPublicUrls(catalog: AssetCatalog): AssetCatalog {

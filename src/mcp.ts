@@ -26,6 +26,7 @@ import { runLiveAsset } from "./connectors/runAsset.js";
 import { runStarRocksQuery } from "./connectors/starrocks.js";
 import { assetNotFound, summarizeAsset, toLimitedTextPayload, toTextPayload } from "./format.js";
 import { getRequestContext } from "./requestContext.js";
+import { evaluateSqlGovernance } from "./queryGovernance.js";
 import { buildEffectiveInstructions, getGlobalInstructions, isManagedToolEnabled, listManagedTools } from "./toolStore.js";
 
 export async function createAppDataMcpServer() {
@@ -44,7 +45,7 @@ export async function createAppDataMcpServer() {
 
   if (enabledTools.has("search_assets")) server.tool(
     "search_assets",
-    "Search published PostgreSQL metadata for Metabase dashboards, cards, models and metrics, plus PostHog insights, metrics, tables, and events.",
+    "MANDATORY FIRST STEP for ordinary data questions. Search published governed assets using the user's original question or business keywords. Supports Chinese long-sentence matching and prioritizes Metabase Metric/Model over ad-hoc SQL.",
     {
       query: z.string().default("").describe("Keyword query, e.g. 新增用户, activation, retention."),
       platform: z.enum(["metabase", "posthog", "local"]).optional(),
@@ -76,9 +77,9 @@ export async function createAppDataMcpServer() {
           count: assets.length,
           note: "Results come from published PostgreSQL metadata and are filtered by access snapshots. Use get_asset, trace_asset, or run_asset with an id for details.",
           nextSteps: [
-            "If a curated Metabase/PostHog asset answers the question, prefer run_asset. For Metabase metrics, inspect metric.formula, dataSource, defaultTimeDimension, dimensions, and dependencies before choosing breakdowns.",
+            "Inspect the best Metric/Model candidate with get_asset, then use run_asset. For Metabase metrics, preserve metric.formula and use semantic.filters/breakouts.",
             "For Metabase dashboards, inspect parameters and dashboardParameterMappings to decide whether filters can answer the user's question.",
-            "If no curated asset matches or custom breakdowns are needed, use semantic tools when configured."
+            "Do not call query_starrocks while a suitable candidate exists. SQL fallback requires rejecting returned candidate IDs with a concrete reason."
           ]
         });
       });
@@ -326,22 +327,34 @@ export async function createAppDataMcpServer() {
 
   if (enabledTools.has("query_starrocks")) server.tool(
     "query_starrocks",
-    "Execute one read-only SQL query against StarRocks. Use SHOW/DESCRIBE to inspect unfamiliar schemas, then SELECT/WITH for data. DDL, DML, multi-statement SQL, file reads, and long-running helper functions are rejected. Prefer curated run_asset results when available.",
+    "Fallback-only StarRocks SQL. The original data question is required and the server searches published governed assets before executing. If Metric/Model/Card candidates exist, SQL is blocked until they are inspected and explicitly rejected with a reason. Use purpose=user_requested_sql only when the user explicitly asks for SQL.",
     {
+      question: z.string().min(2).max(1000).describe("The user's original natural-language data question. Required for server-side governed asset discovery."),
       sql: z
         .string()
         .min(1)
         .max(getStarRocksConfig().maxSqlLength)
         .describe("One StarRocks read-only SQL statement: SELECT, WITH...SELECT, SHOW, DESCRIBE/DESC, or EXPLAIN."),
+      purpose: z.enum(["data_question", "metadata_inspection", "user_requested_sql"])
+        .default("data_question")
+        .describe("Use data_question normally; metadata_inspection only for SHOW/DESCRIBE/EXPLAIN; user_requested_sql only when the user explicitly requested direct SQL."),
+      rejected_asset_ids: z.array(z.string()).max(20).optional().describe("Governed asset IDs previously returned by this tool that were inspected and found unsuitable."),
+      fallback_reason: z.string().min(5).max(1000).optional().describe("Required when rejected_asset_ids is non-empty; explain why those assets cannot answer the question."),
       limit: z.number().int().min(1).max(limits.maxResultRowLimit).default(limits.defaultResultRowLimit)
     },
-    async ({ sql, limit }) => {
+    async ({ question, sql, purpose, rejected_asset_ids, fallback_reason, limit }) => {
       const auditDetails: AuditDetails = {
         query: sql,
         limit,
         assetPlatform: "starrocks",
         assetType: "adhoc_sql",
-        metadata: { database: getStarRocksConfig().database }
+        metadata: {
+          database: getStarRocksConfig().database,
+          question,
+          purpose,
+          rejectedAssetIds: rejected_asset_ids,
+          fallbackReason: fallback_reason
+        }
       };
       return auditToolCall("query_starrocks", auditDetails, async () => {
         if (!await isManagedToolEnabled("query_starrocks")) {
@@ -354,6 +367,31 @@ export async function createAppDataMcpServer() {
         const authError = requireUserToken();
         if (authError) return authError;
 
+        const candidates = purpose === "data_question"
+          ? filterAssetsBySnapshotAccess(
+              await catalog.search({ query: question, limit: Math.min(limits.maxSearchLimit, 20) }),
+              getRequestContext().user
+            ).filter((asset) => ["metric", "model", "card", "dashboard", "insight"].includes(asset.type))
+          : [];
+        const governance = evaluateSqlGovernance(candidates, {
+          sql,
+          purpose,
+          rejectedAssetIds: rejected_asset_ids,
+          fallbackReason: fallback_reason
+        });
+        if (!governance.allowed) {
+          return toTextPayload({
+            error: governance.code,
+            message: governance.message,
+            question,
+            candidates: governance.candidates.map(summarizeAsset),
+            requiredNextStep: governance.code === "governed_assets_available"
+              ? "Call get_asset for the best candidate, then run_asset. If every candidate is unsuitable, call query_starrocks again with their IDs in rejected_asset_ids and a concrete fallback_reason."
+              : "Correct the query_starrocks governance arguments before retrying.",
+            sqlExecuted: false
+          });
+        }
+
         try {
           const data = await runStarRocksQuery(sql, limit);
           return toLimitedTextPayload({
@@ -361,6 +399,13 @@ export async function createAppDataMcpServer() {
             source: {
               platform: "starrocks",
               database: data.database
+            },
+            governance: {
+              purpose,
+              question,
+              checkedCandidateCount: candidates.length,
+              rejectedAssetIds: rejected_asset_ids ?? [],
+              fallbackReason: fallback_reason
             },
             warnings: data.truncated ? [`Result truncated to ${limit} rows.`] : []
           }, limits.maxResponseBytes);
