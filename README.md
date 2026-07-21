@@ -8,6 +8,8 @@
 - `get_asset`: 查看单个资产完整元信息。
 - `trace_asset`: 查看资产的 SQL / 事件 / 上游表 / 原始链接。
 - `run_asset`: 只读返回支持资产的真实数据；不支持时读取本地 `sampleData` 兜底。
+- `query_audience`: 使用统一 `uid` 对 2-10 个 Metabase Model 做交集、并集或差集计算。
+- `export_audience`: 将完整 UID 人群导出为有期限的服务端 CSV 下载文件。
 - `query_starrocks`: 治理资产无法回答后的受控 StarRocks SQL 回退；执行前会再次搜索 Metric/Model/Card。
 - `list_domains`: 查看配置里已有的业务域。
 - `auth_status`: 查看当前请求用户和 Metabase 授权状态。
@@ -152,9 +154,76 @@ Model 可以选择明细字段：
 
 筛选操作符包括 `eq`、`neq`、`gt`、`gte`、`lt`、`lte`、`in`、`not_in`、`contains`、`is_null`、`not_null`、`between`；聚合包括 `count`、`distinct`、`sum`、`avg`、`min`、`max`。语义查询与 `params` 不能同时使用，Card、Dashboard 和 PostHog Insight 不接受 `semantic`。
 
+### 用户人群组合查询
+
+Metabase 同步会为包含 `uid` 字段的 Model 生成 `audience` 元数据。`query_audience` 要求所有输入 Model 位于同一个 Metabase database，并使用当前用户的 Metabase Session 在 `/api/dataset` 内完成集合计算。每个 Model 会先在数据源侧应用筛选并按 `uid` 去重，再执行集合连接，不会先把各 Model 的 UID 拉回 MCP 客户端。
+
+```json
+{
+  "operator": "intersection",
+  "models": [
+    {
+      "asset_id": "metabase:model:101",
+      "filters": [
+        { "field": "event_time", "operator": "gte", "value": "2026-07-01" }
+      ]
+    },
+    {
+      "asset_id": "metabase:model:102",
+      "filters": [
+        { "field": "topic", "operator": "eq", "value": "母婴" }
+      ]
+    }
+  ],
+  "output": "count",
+  "limit": 100
+}
+```
+
+`operator` 支持 `intersection`、`union` 和 `difference`；`difference` 表示第一个 Model 减去后续所有 Model。`output=count` 默认只返回去重用户数；`output=uids` 返回去重 UID，并受全局最大行数和响应大小限制。每个 Model 最多包含 20 个受控语义筛选条件。
+
+需要完整 UID 文件时使用 `export_audience`，不要循环调用有限的 `query_audience` 结果：
+
+```json
+{
+  "operator": "intersection",
+  "models": [
+    { "asset_id": "metabase:model:493", "filters": [{ "field": "deleted", "operator": "eq", "value": 0 }] },
+    { "asset_id": "metabase:model:496", "filters": [{ "field": "status", "operator": "eq", "value": 1 }] }
+  ],
+  "filename": "community-active-users.csv"
+}
+```
+
+服务端通过 Metabase CSV endpoint 获取完整的单列 UID 结果，生成随机 capability 下载地址，默认 24 小时后失效，并由后台定时清理。超过行数或文件字节上限时整个导出失败，不会生成截断文件。下载地址相当于临时访问凭证，不应公开分享。
+
 ### 治理资产优先与 SQL 回退
 
-普通数据问题必须先调用 `search_assets`。搜索支持直接传入中文长句，会拆分中文二元/三元语义片段，并优先排序 Metric、Model，再考虑 Card。只有管理后台已开放且有效的资产会参与搜索和 SQL 治理检查。
+普通数据问题必须先调用 `search_assets`。搜索支持直接传入中文长句，会拆分中文二元/三元语义片段，并按 `Metric > Model > Card > Dashboard` 返回候选；同类型资产仍保持相关度顺序。返回值中的 `selection.recommendedAssetId`、`candidateOrder`，以及每项资产的 `selection.rank/typePriority/recommended` 会明确告诉 AI 应先检查哪个资产。只有管理后台已开放且有效的资产会参与搜索和治理检查。
+
+当 AI 在 Model 上使用 `semantic.aggregations` 重新计算 `count`、`distinct`、`sum` 等指标时，`run_asset` 会进行第二次服务端检查：
+
+- 必须传入用户原始 `question`，否则返回 `asset_question_required`。
+- 如果仍有匹配 Metric，返回 `higher_priority_metric_available` 并拒绝执行 Model。
+- AI 必须逐个 `get_asset` 检查候选 Metric；确认不适用后，把所有相关 ID 放入 `rejected_asset_ids` 并提供具体 `fallback_reason`。
+- 拒绝 Metric 却不说明原因时返回 `fallback_reason_required`。
+- Model 的 `semantic.fields` 明细查询不属于重新计算指标，不受这项拦截影响。
+
+例如只有在治理 Metric 缺少用户要求的维度时，才允许这样显式降级：
+
+```json
+{
+  "asset_id": "metabase:model:492",
+  "question": "查询按实验分组拆分的中国地区绑定设备用户数",
+  "rejected_asset_ids": ["metabase:metric:483"],
+  "fallback_reason": "Metric 483 没有实验分组维度",
+  "semantic": {
+    "filters": [{ "field": "country_ad_ch", "operator": "eq", "value": "中国" }],
+    "aggregations": [{ "operator": "distinct", "field": "uid", "alias": "user_count" }],
+    "breakouts": [{ "field": "experiment_group" }]
+  }
+}
+```
 
 `query_starrocks` 要求同时传入用户原始问题，并在执行 SQL 前由服务端再次搜索治理资产：
 
@@ -357,16 +426,17 @@ npm run sync:all
 
 - 已存在的资产更新 `metadata` 和同步时间，不覆盖管理员设置的 `is_published` 和人工配置。
 - 新资产默认 `is_published=false`；可通过 `METADATA_DEFAULT_PUBLISHED=true` 调整，但生产环境不建议。
-- 平台中已经消失的资产会标记为 inactive，不再对 MCP 暴露。
+- 平台中已经消失的资产会标记为 inactive，并自动设置 `is_published=false`，不再对 MCP 暴露；未来重新同步出现时也不会自动恢复开放。
 - 不会创建、更新、删除 Metabase/PostHog 平台内的任何对象。
 
 Metabase 同步会为 dashboard/card/model/metric 写入权限快照 `asset.access`，包括 collection、creator、archived、personal collection、同步时间等。MCP 使用两级过滤：
 
-Card、Model 与 Metric 同步会在读取 `/api/card` 列表后，以受限并发继续读取 `/api/card/:id` 详情，并优先使用详情中的 `dataset_query`、`result_metadata`、参数和更新时间。Model 保存为 `metabase:model:<id>`，Metric 保存为 `metabase:metric:<id>`。Metric 还会保存公式、筛选条件、数据来源、默认时间维度、可拆分维度和上下游资产依赖；字段元信息区分 `name`、`displayName` 与真实 `description`。对象在 Card、Model、Metric 之间转换时，会迁移原记录并保留开放状态和后台人工配置。详情请求失败时会保留列表数据，并在同步日志和资产 `warnings` 中标记。
+Card、Model 与 Metric 同步会在读取 `/api/card` 列表后，以受限并发继续读取 `/api/card/:id` 详情，并优先使用详情中的 `dataset_query`、`result_metadata`、参数和更新时间。Model 保存为 `metabase:model:<id>`，Metric 保存为 `metabase:metric:<id>`。包含 `uid` 的 Model 会额外保存 `audience` 元数据和 database id，用于服务端人群组合查询。Metric 还会保存公式、筛选条件、数据来源、默认时间维度、可拆分维度和上下游资产依赖；字段元信息区分 `name`、`displayName` 与真实 `description`。对象在 Card、Model、Metric 之间转换时，会迁移原记录并保留开放状态和后台人工配置。详情请求失败时会保留列表数据，并在同步日志和资产 `warnings` 中标记。
 
 - `search_assets` / `list_domains`: 用本地权限快照快速过滤归档资产和非本人 personal collection。
 - `get_asset` / `trace_asset`: 先做本地快照过滤，再用当前用户 Metabase session 实时请求 `GET /api/card/:id` 或 `GET /api/dashboard/:id` 校验可见性。
 - `run_asset`: 继续使用用户 Metabase session 执行只读查询，保留平台实时权限判断。
+- `query_audience`: 对每个输入 Model 做快照和实时权限校验，再使用同一用户 Session 执行组合查询。
 
 部署或升级后执行一次完整同步：
 

@@ -129,6 +129,12 @@ export async function upsertPlatformAssets(platform: DataPlatform, assets: DataA
         ]
       );
     }
+    await connection.query(
+      `update ${tableName}
+       set is_published = false, updated_at = now()
+       where platform = $1 and is_active = false and is_published = true`,
+      [platform]
+    );
     await connection.query("commit");
     return { platform, synced: uniqueAssets.length, active: uniqueAssets.length };
   } catch (error) {

@@ -7,11 +7,18 @@ import {
   filterAssetsBySnapshotAccess
 } from "./accessPolicy.js";
 import { auditToolCall, type AuditDetails } from "./audit.js";
+import {
+  buildAssetSelectionSummary,
+  evaluateModelAggregationSelection,
+  orderAssetsByGovernancePriority,
+  summarizeSelectionRank
+} from "./assetSelectionGovernance.js";
 import { getMetabaseLoginUrl } from "./auth/loginRoutes.js";
 import { getStoredMetabaseSessionStatus } from "./auth/metabaseSessions.js";
 import { CatalogStore } from "./catalog.js";
 import {
   ACCESS_MODE,
+  getAudienceExportConfig,
   getAuditConfig,
   getAuthConfig,
   getDataLimitConfig,
@@ -22,7 +29,9 @@ import {
   getStarRocksConfig,
   getSyncFreshnessConfig
 } from "./config.js";
+import { createAudienceExport } from "./audienceExports.js";
 import { runLiveAsset } from "./connectors/runAsset.js";
+import { runMetabaseAudience, runMetabaseAudienceCsv } from "./connectors/metabase.js";
 import { runStarRocksQuery } from "./connectors/starrocks.js";
 import { assetNotFound, summarizeAsset, toLimitedTextPayload, toTextPayload } from "./format.js";
 import { getRequestContext } from "./requestContext.js";
@@ -45,7 +54,7 @@ export async function createAppDataMcpServer() {
 
   if (enabledTools.has("search_assets")) server.tool(
     "search_assets",
-    "MANDATORY FIRST STEP for ordinary data questions. Search published governed assets using the user's original question or business keywords. Supports Chinese long-sentence matching and prioritizes Metabase Metric/Model over ad-hoc SQL.",
+    "MANDATORY FIRST STEP for ordinary data questions. Search published governed assets using the user's original question. Selection order is Metric > Model > Card > Dashboard: inspect matching Metrics before using a Model to recompute an aggregation.",
     {
       query: z.string().default("").describe("Keyword query, e.g. 新增用户, activation, retention."),
       platform: z.enum(["metabase", "posthog", "local"]).optional(),
@@ -68,16 +77,22 @@ export async function createAppDataMcpServer() {
 
         const requestContext = getRequestContext();
         const requestedLimit = input.limit ?? limits.defaultSearchLimit;
-        const assets = filterAssetsBySnapshotAccess(
+        const assets = orderAssetsByGovernancePriority(filterAssetsBySnapshotAccess(
           await catalog.search({ ...input, limit: limits.maxSearchLimit }),
           requestContext.user
-        ).slice(0, requestedLimit);
+        )).slice(0, requestedLimit);
+        const selection = buildAssetSelectionSummary(assets);
         return toTextPayload({
-          assets: assets.map(summarizeAsset),
+          assets: assets.map((asset, index) => ({
+            ...summarizeAsset(asset),
+            selection: summarizeSelectionRank(asset, index + 1, selection.recommendedAssetId)
+          })),
           count: assets.length,
+          selection,
           note: "Results come from published PostgreSQL metadata and are filtered by access snapshots. Use get_asset, trace_asset, or run_asset with an id for details.",
           nextSteps: [
-            "Inspect the best Metric/Model candidate with get_asset, then use run_asset. For Metabase metrics, preserve metric.formula and use semantic.filters/breakouts.",
+            "Inspect matching Metric candidates with get_asset before selecting a Model. For Metabase Metrics, preserve metric.formula and use semantic.filters/breakouts.",
+            "Do not use Model aggregations to recreate a Metric. Model aggregation fallback requires the original question plus rejected_asset_ids and a concrete fallback_reason.",
             "For Metabase dashboards, inspect parameters and dashboardParameterMappings to decide whether filters can answer the user's question.",
             "Do not call query_starrocks while a suitable candidate exists. SQL fallback requires rejecting returned candidate IDs with a concrete reason."
           ]
@@ -156,9 +171,18 @@ export async function createAppDataMcpServer() {
 
   if (enabledTools.has("run_asset")) server.tool(
     "run_asset",
-    "Return read-only live data for a supported Metabase/PostHog asset. Metabase Model and Metric assets support validated semantic filters, fields, aggregations, and breakouts.",
+    "Return read-only live data for a supported Metabase/PostHog asset. Metric is preferred over Model for governed aggregations. Model aggregations require question and are blocked while a matching Metric remains unrejected.",
     {
       asset_id: z.string(),
+      question: z.string().min(1).optional().describe(
+        "The user's original data question. Required when semantic.aggregations is used on a Model so the server can enforce Metric-first selection."
+      ),
+      rejected_asset_ids: z.array(z.string().min(1)).max(50).optional().describe(
+        "Matching higher-priority Metric IDs already inspected and found unsuitable. Requires fallback_reason."
+      ),
+      fallback_reason: z.string().min(1).max(1000).optional().describe(
+        "Concrete reason the rejected Metric candidates cannot answer the question."
+      ),
       params: z
         .record(z.unknown())
         .optional()
@@ -186,8 +210,18 @@ export async function createAppDataMcpServer() {
       ),
       limit: z.number().int().min(1).max(limits.maxResultRowLimit).default(limits.defaultResultRowLimit)
     },
-    async ({ asset_id, params, semantic, limit }) => {
-      const auditDetails: AuditDetails = { assetId: asset_id, params, limit, metadata: semantic ? { semantic } : undefined };
+    async ({ asset_id, question, rejected_asset_ids, fallback_reason, params, semantic, limit }) => {
+      const auditDetails: AuditDetails = {
+        assetId: asset_id,
+        query: question,
+        params,
+        limit,
+        metadata: {
+          ...(semantic ? { semantic } : {}),
+          ...(rejected_asset_ids?.length ? { rejectedAssetIds: rejected_asset_ids } : {}),
+          ...(fallback_reason ? { fallbackReason: fallback_reason } : {})
+        }
+      };
       return auditToolCall("run_asset", auditDetails, async () => {
         const authError = requireUserToken();
         if (authError) return authError;
@@ -203,6 +237,29 @@ export async function createAppDataMcpServer() {
             asset_id,
             reason: snapshotDecision.reason,
             message: "This asset is hidden by the synchronized metadata access snapshot."
+          });
+        }
+        const metricCandidates = question?.trim()
+          ? filterAssetsBySnapshotAccess(
+              await catalog.search({ query: question, platform: asset.platform, limit: limits.maxSearchLimit }),
+              getRequestContext().user
+            ).filter((candidate) => candidate.type === "metric")
+          : [];
+        const selectionDecision = evaluateModelAggregationSelection(asset, metricCandidates, {
+          question,
+          rejectedAssetIds: rejected_asset_ids,
+          fallbackReason: fallback_reason,
+          hasAggregations: Boolean(semantic?.aggregations?.length)
+        });
+        if (!selectionDecision.allowed) {
+          return toTextPayload({
+            error: selectionDecision.code,
+            message: selectionDecision.message,
+            attempted_asset: summarizeAsset(asset),
+            metric_candidates: selectionDecision.candidates.map(summarizeAsset),
+            required_action: selectionDecision.code === "asset_question_required"
+              ? "Retry run_asset with the user's original question."
+              : "Inspect each Metric with get_asset and run a suitable Metric. To fall back, retry with all unsuitable Metric IDs in rejected_asset_ids and provide fallback_reason."
           });
         }
         const paramsError = validateAssetParams(asset, params);
@@ -321,6 +378,186 @@ export async function createAppDataMcpServer() {
             ...(wasTruncated ? [`Result truncated to ${limit} rows.`] : [])
           ]
         }, limits.maxResponseBytes);
+      });
+    }
+  );
+
+  if (enabledTools.has("query_audience")) server.tool(
+    "query_audience",
+    "Compose 2-10 audience-enabled Metabase Models by their governed uid field. Supports intersection, union, and first-model-minus-rest difference. The complete set operation runs inside Metabase with the current user's Session; IDs are never combined client-side.",
+    {
+      operator: z.enum(["intersection", "union", "difference"]).default("intersection"),
+      models: z.array(z.object({
+        asset_id: z.string().min(1),
+        filters: z.array(z.object({
+          field: z.string().min(1),
+          operator: z.enum(["eq", "neq", "gt", "gte", "lt", "lte", "in", "not_in", "contains", "is_null", "not_null", "between"]),
+          value: z.unknown().optional()
+        }).strict()).max(20).optional()
+      }).strict()).min(2).max(10),
+      output: z.enum(["count", "uids"]).default("count"),
+      limit: z.number().int().min(1).max(limits.maxResultRowLimit).default(limits.defaultResultRowLimit)
+    },
+    async ({ operator, models, output, limit }) => {
+      const assetIds = models.map((model) => model.asset_id);
+      const auditDetails: AuditDetails = {
+        assetId: assetIds.join(","),
+        assetPlatform: "metabase",
+        assetType: "audience",
+        params: models,
+        limit: output === "count" ? 1 : limit,
+        metadata: { operator, output, assetIds }
+      };
+      return auditToolCall("query_audience", auditDetails, async () => {
+        const authError = requireUserToken();
+        if (authError) return authError;
+
+        const assets = await Promise.all(assetIds.map((assetId) => catalog.findById(assetId)));
+        const missing = assetIds.filter((_, index) => !assets[index]);
+        if (missing.length) {
+          return toTextPayload({
+            error: "asset_not_found",
+            asset_ids: missing,
+            message: `No data assets found for: ${missing.join(", ")}`
+          });
+        }
+
+        for (const asset of assets) {
+          const accessError = await requireMetadataAccess(asset!);
+          if (accessError) return accessError;
+        }
+
+        try {
+          const data = await runMetabaseAudience(
+            models.map((model, index) => ({ asset: assets[index]!, filters: model.filters })),
+            { operator, output, limit }
+          );
+          return toLimitedTextPayload({
+            audience: {
+              entityType: "user",
+              identityField: "uid",
+              operator,
+              output,
+              models: assets.map((asset) => summarizeAsset(asset!))
+            },
+            data,
+            warnings: [
+              "Audience membership was computed inside Metabase using the current user's permissions.",
+              ...(output === "uids" && data.truncated ? [`UID output truncated to ${limit} rows.`] : [])
+            ]
+          }, limits.maxResponseBytes);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          return toTextPayload({
+            error: isReauthError(error)
+              ? "reauth_required"
+              : message.includes(":") ? message.slice(0, message.indexOf(":")) : "audience_query_failed",
+            message,
+            asset_ids: assetIds,
+            loginUrl: isReauthError(error) ? getMetabaseLoginUrl() : undefined
+          });
+        }
+      });
+    }
+  );
+
+  if (enabledTools.has("export_audience")) server.tool(
+    "export_audience",
+    "Export the complete governed UID result for 2-10 audience-enabled Metabase Models to a temporary CSV. The set operation runs inside Metabase with the current user's permissions; the CSV is stored server-side and returned as an expiring download URL. Fails instead of silently truncating when the configured row or byte limit is exceeded.",
+    {
+      operator: z.enum(["intersection", "union", "difference"]).default("intersection"),
+      models: z.array(z.object({
+        asset_id: z.string().min(1),
+        filters: z.array(z.object({
+          field: z.string().min(1),
+          operator: z.enum(["eq", "neq", "gt", "gte", "lt", "lte", "in", "not_in", "contains", "is_null", "not_null", "between"]),
+          value: z.unknown().optional()
+        }).strict()).max(20).optional()
+      }).strict()).min(2).max(10),
+      filename: z.string().min(1).max(100).optional(),
+      max_rows: z.number().int().min(1).max(getAudienceExportConfig().maxRows).default(getAudienceExportConfig().maxRows)
+    },
+    async ({ operator, models, filename, max_rows }) => {
+      const assetIds = models.map((model) => model.asset_id);
+      const auditDetails: AuditDetails = {
+        assetId: assetIds.join(","),
+        assetPlatform: "metabase",
+        assetType: "audience_export",
+        params: models,
+        limit: max_rows,
+        metadata: { operator, assetIds, filename }
+      };
+      return auditToolCall("export_audience", auditDetails, async () => {
+        const authError = requireUserToken();
+        if (authError) return authError;
+
+        const assets = await Promise.all(assetIds.map((assetId) => catalog.findById(assetId)));
+        const missing = assetIds.filter((_, index) => !assets[index]);
+        if (missing.length) {
+          return toTextPayload({
+            error: "asset_not_found",
+            asset_ids: missing,
+            message: `No data assets found for: ${missing.join(", ")}`
+          });
+        }
+        for (const asset of assets) {
+          const accessError = await requireMetadataAccess(asset!);
+          if (accessError) return accessError;
+        }
+
+        try {
+          const data = await runMetabaseAudienceCsv(
+            models.map((model, index) => ({ asset: assets[index]!, filters: model.filters })),
+            { operator, limit: max_rows }
+          );
+          if (data.truncated) {
+            return toTextPayload({
+              error: "audience_export_too_many_rows",
+              message: `Audience exceeds the export limit of ${max_rows} UID rows. Add filters or raise AUDIENCE_EXPORT_MAX_ROWS within the server's safe capacity.`,
+              maxRows: max_rows,
+              exported: false
+            });
+          }
+          const result = await createAudienceExport(data.uids, {
+            user: getRequestContext().user,
+            filename
+          });
+          return toTextPayload({
+            count: result.rowCount,
+            export: {
+              format: "csv",
+              filename: result.downloadName,
+              rowCount: result.rowCount,
+              bytes: result.bytes,
+              sha256: result.sha256,
+              createdAt: result.createdAt,
+              expiresAt: result.expiresAt,
+              downloadUrl: result.downloadUrl,
+              localPath: result.localPath
+            },
+            audience: {
+              entityType: "user",
+              identityField: "uid",
+              operator,
+              assetIds
+            },
+            warnings: [
+              "The download URL is a temporary bearer capability. Do not share it with unauthorized users.",
+              "The export contains complete user-level identifiers and is automatically deleted after expiry."
+            ]
+          });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          return toTextPayload({
+            error: isReauthError(error)
+              ? "reauth_required"
+              : message.includes(":") ? message.slice(0, message.indexOf(":")) : "audience_export_failed",
+            message,
+            asset_ids: assetIds,
+            exported: false,
+            loginUrl: isReauthError(error) ? getMetabaseLoginUrl() : undefined
+          });
+        }
       });
     }
   );

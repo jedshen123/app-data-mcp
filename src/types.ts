@@ -120,6 +120,22 @@ export type MetricMetadata = {
   queryDescription?: string;
 };
 
+export type AudienceMetadata = {
+  entityType: "user";
+  identityField: string;
+  identityType: string;
+  databaseId: number;
+};
+
+export type AudienceOperator = "intersection" | "union" | "difference";
+
+export type AudienceOutput = "count" | "uids";
+
+export type AudienceModelInput = {
+  asset: DataAsset;
+  filters?: SemanticFilter[];
+};
+
 export type DataAccessSnapshot = {
   source: "metabase-sync" | "posthog-sync" | "local-config";
   syncedAt: string;
@@ -156,6 +172,7 @@ export type DataAsset = {
   parameters?: AssetParameter[];
   dashboardParameterMappings?: DashboardParameterMapping[];
   metric?: MetricMetadata;
+  audience?: AudienceMetadata;
   access?: DataAccessSnapshot;
   warnings?: string[];
 };

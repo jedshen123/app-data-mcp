@@ -43,6 +43,7 @@ export function summarizeAsset(asset: DataAsset) {
       downstreamAssets: asset.metric.downstreamAssets,
       queryDescription: asset.metric.queryDescription
     } : undefined,
+    audience: asset.audience,
     access: asset.access
       ? {
           visibility: asset.access.visibility,

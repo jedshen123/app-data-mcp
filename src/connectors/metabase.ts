@@ -5,6 +5,9 @@ import { getStoredMetabaseSession } from "../auth/metabaseSessions.js";
 import { getRequestContext } from "../requestContext.js";
 import type {
   AssetParameter,
+  AudienceModelInput,
+  AudienceOperator,
+  AudienceOutput,
   ColumnMeta,
   DashboardParameterMapping,
   DataAsset,
@@ -33,6 +36,12 @@ type NormalizedResult = {
   limitApplied: number;
   truncated: boolean;
   rawShape: string;
+};
+
+type AudienceRunOptions = {
+  operator: AudienceOperator;
+  output: AudienceOutput;
+  limit: number;
 };
 
 export async function runMetabaseAsset(asset: DataAsset, options: RunOptions) {
@@ -85,6 +94,161 @@ export async function runMetabaseAsset(asset: DataAsset, options: RunOptions) {
   }
 
   throw new Error(`Metabase execution is only supported for card, model, metric, and dashboard assets, got ${asset.type}.`);
+}
+
+export async function runMetabaseAudience(
+  models: AudienceModelInput[],
+  options: AudienceRunOptions
+): Promise<NormalizedResult> {
+  const client = await createMetabaseClient();
+  const query = buildMetabaseAudienceQuery(models, options);
+  const value = await fetchJson<unknown>(joinUrl(client.baseUrl, "/api/dataset"), {
+    method: "POST",
+    headers: {
+      ...client.headers,
+      "content-type": "application/json"
+    },
+    body: JSON.stringify(query)
+  });
+  return normalizeDatasetResponse(value, options.output === "count" ? 1 : options.limit);
+}
+
+export async function runMetabaseAudienceCsv(
+  models: AudienceModelInput[],
+  options: { operator: AudienceOperator; limit: number }
+): Promise<{ uids: string[]; truncated: boolean; totalRowsReturned: number }> {
+  const client = await createMetabaseClient();
+  const query = buildMetabaseAudienceQuery(models, { ...options, output: "uids" });
+  const url = joinUrl(client.baseUrl, "/api/dataset/csv?format_rows=false");
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      ...client.headers,
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({ query })
+  });
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new Error(`HTTP ${response.status} ${response.statusText} for ${url}${body ? `: ${body.slice(0, 500)}` : ""}`);
+  }
+  const records = parseCsvRecords(await response.text());
+  if (!records.length) throw new Error("audience_export_invalid_csv: Metabase returned an empty CSV response.");
+  const dataRecords = records.slice(1).filter((record) => record.length > 1 || record[0] !== "");
+  if (dataRecords.some((record) => record.length !== 1)) {
+    throw new Error("audience_export_invalid_csv: expected exactly one uid column.");
+  }
+  return {
+    uids: dataRecords.slice(0, options.limit).map((record) => record[0]),
+    truncated: dataRecords.length > options.limit,
+    totalRowsReturned: dataRecords.length
+  };
+}
+
+export function buildMetabaseAudienceQuery(
+  models: AudienceModelInput[],
+  options: AudienceRunOptions
+): Record<string, unknown> {
+  if (models.length < 2 || models.length > 10) {
+    throw new Error("audience_invalid_models: audience queries require 2-10 Models.");
+  }
+  if (!Number.isInteger(options.limit) || options.limit < 1) {
+    throw new Error("audience_invalid_limit: limit must be a positive integer.");
+  }
+
+  const databaseIds = new Set<number>();
+  const identityTypeFamilies = new Set<string>();
+  const prepared = models.map(({ asset, filters }, index) => {
+    if (asset.platform !== "metabase" || asset.type !== "model") {
+      throw new Error(`audience_invalid_asset: ${asset.id} is not a Metabase Model.`);
+    }
+    if (!asset.audience || asset.audience.entityType !== "user") {
+      throw new Error(`audience_uid_missing: ${asset.id} is not audience-enabled; synchronize a Model containing uid.`);
+    }
+    if (!Number.isInteger(asset.audience.databaseId) || asset.audience.databaseId <= 0) {
+      throw new Error(`audience_database_missing: ${asset.id} has no synchronized Metabase database id.`);
+    }
+    if ((filters?.length ?? 0) > 20) {
+      throw new Error(`audience_too_many_filters: ${asset.id} exceeds 20 filters.`);
+    }
+    databaseIds.add(asset.audience.databaseId);
+    identityTypeFamilies.add(identityTypeFamily(asset.audience.identityType));
+    const dimensions = asset.columns ?? [];
+    const uidDimension = resolveDimension(asset.audience.identityField, dimensions);
+    const alias = index === 0 ? undefined : `audience_${index + 1}`;
+    return { asset, filters, dimensions, uidDimension, alias };
+  });
+  if (databaseIds.size !== 1) {
+    throw new Error("audience_database_mismatch: all Models must belong to the same Metabase database.");
+  }
+  if (identityTypeFamilies.size !== 1) {
+    throw new Error("audience_uid_type_mismatch: all uid fields must use compatible data types.");
+  }
+
+  const primaryUid = buildFieldRef(prepared[0].uidDimension);
+  const joinedUids: unknown[] = [];
+  const joins: Record<string, unknown>[] = [];
+
+  for (let index = 1; index < prepared.length; index += 1) {
+    const item = prepared[index];
+    const joinedUid = buildFieldRef(item.uidDimension, undefined, item.alias);
+    joinedUids.push(joinedUid);
+    const leftUid = options.operator === "union"
+      ? buildCoalesce([primaryUid, ...joinedUids.slice(0, -1)])
+      : primaryUid;
+    const equality = ["=", { "lib/uuid": randomUUID() }, leftUid, joinedUid];
+    joins.push({
+      "lib/type": "mbql/join",
+      "lib/options": { "lib/uuid": randomUUID() },
+      alias: item.alias,
+      strategy: options.operator === "intersection" ? "inner-join" : options.operator === "difference" ? "left-join" : "full-join",
+      stages: [buildAudienceLeafStage(item)],
+      conditions: [equality]
+    });
+  }
+
+  let resultUid: unknown = primaryUid;
+  if (options.operator === "union") {
+    resultUid = buildCoalesce([primaryUid, ...joinedUids]);
+  }
+
+  const stage: Record<string, unknown> = {
+    "lib/type": "mbql.stage/mbql",
+    joins,
+    limit: options.output === "count" ? 1 : options.limit + 1
+  };
+  if (options.operator === "difference") {
+    stage.filters = joinedUids.map((uid) => ["is-null", { "lib/uuid": randomUUID() }, uid]);
+  }
+  if (options.output === "count") {
+    stage.aggregation = [["distinct", { "lib/uuid": randomUUID(), name: "audience_count" }, resultUid]];
+  } else {
+    stage.breakout = [resultUid];
+  }
+
+  return freshenMbqlUuids({
+    "lib/type": "mbql/query",
+    database: databaseIds.values().next().value,
+    stages: [buildAudienceLeafStage(prepared[0]), stage]
+  }) as Record<string, unknown>;
+}
+
+function buildAudienceLeafStage(item: {
+  asset: DataAsset;
+  filters?: SemanticFilter[];
+  dimensions: ColumnMeta[];
+  uidDimension: ColumnMeta;
+}): Record<string, unknown> {
+  const uid = buildFieldRef(item.uidDimension);
+  return {
+    "lib/type": "mbql.stage/mbql",
+    "source-card": Number(getAssetNumericId(item.asset.id)),
+    filters: [
+      ["not-null", { "lib/uuid": randomUUID() }, uid],
+      ...(item.filters ?? []).map((filter) => buildFilter(filter, item.dimensions))
+    ],
+    breakout: [uid]
+  };
 }
 
 async function runMetabaseSemanticQuery(
@@ -197,9 +361,9 @@ function appendSemanticFilters(
   stage.filters = [...existing, ...filters.map((filter) => buildFilter(filter, dimensions))];
 }
 
-function buildFilter(filter: SemanticFilter, dimensions: ColumnMeta[]): unknown {
+function buildFilter(filter: SemanticFilter, dimensions: ColumnMeta[], joinAlias?: string): unknown {
   const dimension = resolveDimension(filter.field, dimensions);
-  const fieldRef = buildFieldRef(dimension);
+  const fieldRef = buildFieldRef(dimension, undefined, joinAlias);
   const options = { "lib/uuid": randomUUID() };
   switch (filter.operator) {
     case "eq": return ["=", options, fieldRef, requireScalarValue(filter)];
@@ -283,7 +447,7 @@ function resolveDimension(requested: string, dimensions: ColumnMeta[]): ColumnMe
   return matches[0];
 }
 
-function buildFieldRef(dimension: ColumnMeta, temporalUnit?: string): unknown {
+function buildFieldRef(dimension: ColumnMeta, temporalUnit?: string, joinAlias?: string): unknown {
   const ref = structuredClone(dimension.fieldRef);
   if (!Array.isArray(ref) || ref[0] !== "field") throw new Error(`semantic_field_reference_invalid: ${dimension.name}.`);
   const options = isObject(ref[1]) ? ref[1] : {};
@@ -291,9 +455,79 @@ function buildFieldRef(dimension: ColumnMeta, temporalUnit?: string): unknown {
     ...options,
     "base-type": getString(options["base-type"]) ?? dimension.type,
     ...(temporalUnit ? { "temporal-unit": temporalUnit } : {}),
+    ...(joinAlias ? { "join-alias": joinAlias } : {}),
     "lib/uuid": randomUUID()
   };
   return ref;
+}
+
+function buildCoalesce(expressions: unknown[]): unknown {
+  if (expressions.length === 1) return expressions[0];
+  return ["coalesce", { "lib/uuid": randomUUID(), name: "uid" }, ...expressions];
+}
+
+function freshenMbqlUuids(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(freshenMbqlUuids);
+  if (!isObject(value)) return value;
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [
+    key,
+    key === "lib/uuid" ? randomUUID() : freshenMbqlUuids(item)
+  ]));
+}
+
+function identityTypeFamily(type: string): string {
+  if (/integer|float|decimal|number|bigint/i.test(type)) return "number";
+  if (/text|string|varchar|char/i.test(type)) return "text";
+  return type.trim().toLocaleLowerCase();
+}
+
+function parseCsvRecords(csv: string): string[][] {
+  const records: string[][] = [];
+  let record: string[] = [];
+  let field = "";
+  let quoted = false;
+  let touched = false;
+  for (let index = 0; index < csv.length; index += 1) {
+    const char = csv[index];
+    const next = csv[index + 1];
+    if (quoted) {
+      if (char === '"' && next === '"') {
+        field += '"';
+        index += 1;
+      } else if (char === '"') {
+        quoted = false;
+      } else {
+        field += char;
+      }
+      touched = true;
+      continue;
+    }
+    if (char === '"' && field.length === 0) {
+      quoted = true;
+      touched = true;
+    } else if (char === ",") {
+      record.push(field);
+      field = "";
+      touched = true;
+    } else if (char === "\n" || char === "\r") {
+      if (char === "\r" && next === "\n") index += 1;
+      record.push(field);
+      records.push(record);
+      record = [];
+      field = "";
+      touched = false;
+    } else {
+      field += char;
+      touched = true;
+    }
+  }
+  if (quoted) throw new Error("audience_export_invalid_csv: unterminated quoted field.");
+  if (touched || field.length || record.length) {
+    record.push(field);
+    records.push(record);
+  }
+  if (records[0]?.[0]?.charCodeAt(0) === 0xfeff) records[0][0] = records[0][0].slice(1);
+  return records;
 }
 
 function normalizeFieldName(value: string | undefined): string {
@@ -773,7 +1007,7 @@ function pickRaw(value: Record<string, unknown>, keys: string[]): Record<string,
 
 function getAssetNumericId(assetId: string): string {
   const id = assetId.split(":").at(-1);
-  if (!id) throw new Error(`Invalid asset id: ${assetId}`);
+  if (!id || !/^\d+$/.test(id)) throw new Error(`Invalid asset id: ${assetId}`);
   return id;
 }
 

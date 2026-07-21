@@ -62,6 +62,15 @@ export function getDataLimitConfig() {
   };
 }
 
+export function getAudienceExportConfig() {
+  return {
+    directory: process.env.AUDIENCE_EXPORT_DIR ?? ".data/audience-exports",
+    ttlHours: readPositiveInt("AUDIENCE_EXPORT_TTL_HOURS", 24),
+    maxRows: readPositiveInt("AUDIENCE_EXPORT_MAX_ROWS", 100_000),
+    maxBytes: readPositiveInt("AUDIENCE_EXPORT_MAX_BYTES", 20_000_000)
+  };
+}
+
 export function getSyncFreshnessConfig() {
   return {
     metabaseMetadataSyncIntervalHours: readPositiveInt("METABASE_METADATA_SYNC_INTERVAL_HOURS", 6),

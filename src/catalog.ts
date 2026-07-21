@@ -83,6 +83,13 @@ const metricMetadataSchema = z.object({
   queryDescription: z.string().optional()
 });
 
+const audienceMetadataSchema = z.object({
+  entityType: z.literal("user"),
+  identityField: z.string(),
+  identityType: z.string(),
+  databaseId: z.number().int()
+});
+
 const assetSchema = z.object({
   id: z.string(),
   platform: z.enum(["metabase", "posthog", "local"]),
@@ -108,6 +115,7 @@ const assetSchema = z.object({
   parameters: z.array(parameterSchema).optional(),
   dashboardParameterMappings: z.array(dashboardParameterMappingSchema).optional(),
   metric: metricMetadataSchema.optional(),
+  audience: audienceMetadataSchema.optional(),
   access: accessSnapshotSchema.optional(),
   warnings: z.array(z.string()).optional()
 });

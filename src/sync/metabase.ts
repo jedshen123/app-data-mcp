@@ -293,6 +293,10 @@ function toCardAsset(
   const metric = isMetric
     ? readMetabaseMetricMetadata(card, options.cardsById, options.tablesById)
     : undefined;
+  const uidColumn = isModel
+    ? columns?.find((column) => column.name.trim().toLocaleLowerCase() === "uid")
+    : undefined;
+  const databaseId = getNumber(datasetQuery?.database);
   const metricSourceRef = metric?.dataSource
     ? buildMetricSourceRef(metric.dataSource, options.tablesById.get(metric.dataSource.id))
     : undefined;
@@ -312,6 +316,12 @@ function toCardAsset(
     columns,
     parameters,
     metric,
+    audience: uidColumn && databaseId !== undefined ? {
+      entityType: "user",
+      identityField: uidColumn.name,
+      identityType: uidColumn.type,
+      databaseId
+    } : undefined,
     sourceRefs: [
       ...(metricSourceRef ? [metricSourceRef] : []),
       {

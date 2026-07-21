@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
-import { Pool } from "pg";
+import { Pool, type PoolClient } from "pg";
 import { getAuditConfig } from "./config.js";
 import { getRequestContext } from "./requestContext.js";
 
@@ -25,6 +25,7 @@ export type AuditOutputStats = {
 
 let pool: Pool | undefined;
 let initialized = false;
+let initializationPromise: Promise<void> | undefined;
 
 export async function auditToolCall<T>(
   toolName: string,
@@ -159,40 +160,72 @@ async function getAuditPool(): Promise<Pool | undefined> {
 async function ensureAuditTable(client: Pool) {
   if (initialized) return;
 
+  initializationPromise ??= initializeAuditTable(client).catch((error) => {
+    initializationPromise = undefined;
+    throw error;
+  });
+  await initializationPromise;
+  initialized = true;
+}
+
+async function initializeAuditTable(pool: Pool) {
+  const connection = await pool.connect();
+  try {
+    await connection.query("begin");
+    await createAuditTableUnderLock(connection);
+    await connection.query("commit");
+  } catch (error) {
+    await connection.query("rollback").catch(() => undefined);
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
+async function createAuditTableUnderLock(client: PoolClient) {
   const config = getAuditConfig();
   const tableName = qualifiedName(config.schema, config.table);
-  await client.query(`
-    create table if not exists ${tableName} (
-      id bigserial primary key,
-      created_at timestamptz not null default now(),
-      request_id text,
-      user_email text,
-      auth_method text,
-      ai_client text,
-      tool_name text not null,
-      asset_id text,
-      asset_platform text,
-      asset_type text,
-      query_text text,
-      params_hash text,
-      limit_applied integer,
-      row_count integer,
-      result_bytes integer,
-      status text not null,
-      error_code text,
-      error_message text,
-      duration_ms integer,
-      client_ip text,
-      user_agent text,
-      metadata jsonb not null default '{}'::jsonb
-    )
-  `);
+  const relationName = tableName;
+  await client.query("select pg_advisory_xact_lock(hashtext($1))", [`app-data-mcp-audit:${relationName}`]);
+
+  const existing = await client.query<{ relation: string | null }>("select to_regclass($1) as relation", [relationName]);
+  if (!existing.rows[0]?.relation) {
+    const sequenceName = `${config.table}_row_id_seq`;
+    const qualifiedSequence = qualifiedName(config.schema, sequenceName);
+    await client.query(`create sequence if not exists ${qualifiedSequence}`);
+    await client.query(`
+      create table ${tableName} (
+        id bigint primary key default nextval('${qualifiedSequence}'::regclass),
+        created_at timestamptz not null default now(),
+        request_id text,
+        user_email text,
+        auth_method text,
+        ai_client text,
+        tool_name text not null,
+        asset_id text,
+        asset_platform text,
+        asset_type text,
+        query_text text,
+        params_hash text,
+        limit_applied integer,
+        row_count integer,
+        result_bytes integer,
+        status text not null,
+        error_code text,
+        error_message text,
+        duration_ms integer,
+        client_ip text,
+        user_agent text,
+        metadata jsonb not null default '{}'::jsonb
+      )
+    `);
+    await client.query(`alter sequence ${qualifiedSequence} owned by ${tableName}.id`);
+  }
   await client.query(`alter table ${tableName} add column if not exists ai_client text`);
   await client.query(`create index if not exists ${quoteIdentifier(`${config.table}_created_at_idx`)} on ${tableName} (created_at desc)`);
   await client.query(`create index if not exists ${quoteIdentifier(`${config.table}_user_created_at_idx`)} on ${tableName} (user_email, created_at desc)`);
   await client.query(`create index if not exists ${quoteIdentifier(`${config.table}_asset_created_at_idx`)} on ${tableName} (asset_id, created_at desc)`);
   await client.query(`create index if not exists ${quoteIdentifier(`${config.table}_ai_client_created_at_idx`)} on ${tableName} (ai_client, created_at desc)`);
-  initialized = true;
 }
 
 function extractOutputStats(output: unknown): AuditOutputStats {
