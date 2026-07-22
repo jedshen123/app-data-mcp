@@ -30,7 +30,7 @@ test("builds validated Model aggregations, filters, and breakouts", () => {
 
   assert.equal(query.database, 4);
   assert.equal(stage["source-card"], 479);
-  assert.equal(stage.limit, 100);
+  assert.equal(stage.limit, 101);
   assert.deepEqual((stage.filters as unknown[][])[0].slice(0, 1), ["="]);
   assert.deepEqual((stage.aggregation as unknown[][])[0][0], "distinct");
   assert.deepEqual(((stage.breakout as unknown[][])[0][1] as Record<string, unknown>)["temporal-unit"], "month");
@@ -65,7 +65,7 @@ test("preserves a governed Metric formula while replacing default breakouts", ()
   assert.deepEqual((stage.aggregation as unknown[][])[0][0], "distinct");
   assert.deepEqual(stage.breakout, []);
   assert.equal((stage.filters as unknown[][])[0][0], "=");
-  assert.equal(stage.limit, 50);
+  assert.equal(stage.limit, 51);
 });
 
 test("rejects unknown fields and attempts to replace a Metric formula", () => {

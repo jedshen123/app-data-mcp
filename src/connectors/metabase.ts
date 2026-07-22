@@ -292,7 +292,11 @@ export function buildMetabaseSemanticQuery(asset: DataAsset, semantic: SemanticQ
     if (semantic.breakouts !== undefined) {
       definitionStage.breakout = semantic.breakouts.map((breakout) => buildBreakout(breakout, availableDimensions));
     }
-    definitionStage.limit = limit;
+    // Fetch one sentinel row beyond the public response limit. Without this
+    // probe, a result containing exactly `limit` rows is indistinguishable
+    // from a larger result cut off by Metabase, and `truncated` is reported
+    // incorrectly as false.
+    definitionStage.limit = limit + 1;
     return query;
   }
 
@@ -302,7 +306,7 @@ export function buildMetabaseSemanticQuery(asset: DataAsset, semantic: SemanticQ
   const stage: Record<string, unknown> = {
     "lib/type": "mbql.stage/mbql",
     "source-card": Number(getAssetNumericId(asset.id)),
-    limit
+    limit: limit + 1
   };
   appendSemanticFilters(stage, semantic.filters, availableDimensions);
 
