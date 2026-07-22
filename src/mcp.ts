@@ -287,7 +287,7 @@ export async function createAppDataMcpServer() {
                 params: params ?? {},
                 live: false,
                 error: "reauth_required",
-                message: "Metabase rejected the Session associated with this personal MCP token. The MCP token itself has not expired; reauthorize this Metabase account to replace its platform Session.",
+                message: "Metabase rejected the Session associated with this personal MCP token. Reauthorize this Metabase account, then replace the MCP client configuration with the newly issued personal token; the previous token will be invalidated.",
                 loginUrl: getMetabaseLoginUrl(),
                 source: {
                   url: asset.url,
@@ -849,7 +849,9 @@ function buildAuthNextSteps(user: string | undefined, authorized: boolean, login
   }
   return [
     `Open ${loginUrl} and log in as ${user}.`,
-    "Retry the data request after authorization."
+    "Copy the newly issued personal MCP token; reauthorization invalidates the previous token.",
+    "Replace the MCP client's Authorization bearer token with the new token.",
+    "Retry the data request after updating the client configuration."
   ];
 }
 

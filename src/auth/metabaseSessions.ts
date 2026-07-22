@@ -7,7 +7,7 @@ import { fetchJson, joinUrl } from "../sync/http.js";
 type StoredMetabaseSession = {
   user: string;
   session: string;
-  /** Legacy single-token field. Kept so previously issued tokens remain valid. */
+  /** Current token. Legacy session files may also contain mcpTokenHashes. */
   mcpTokenHash?: string;
   mcpTokenHashes?: string[];
   createdAt: string;
@@ -44,14 +44,10 @@ export async function loginMetabaseUser(username: string, password: string): Pro
   const now = new Date();
   const expiresAt = new Date(now.getTime() + getAuthConfig().metabaseSessionTtlHours * 60 * 60 * 1000);
   const mcpToken = createMcpToken();
-  const existing = (await readSessionFile()).sessions[normalizeUser(username)];
   const stored: StoredMetabaseSession = {
     user: username,
     session: session.id,
-    mcpTokenHashes: [
-      ...(existing ? getStoredTokenHashes(existing) : []),
-      hashMcpToken(mcpToken)
-    ],
+    mcpTokenHash: hashMcpToken(mcpToken),
     createdAt: now.toISOString(),
     expiresAt: expiresAt.toISOString()
   };
@@ -69,7 +65,7 @@ export async function getUserForMcpToken(token: string | undefined): Promise<str
   const tokenHash = hashMcpToken(token);
   const file = await readSessionFile();
   for (const entry of Object.values(file.sessions)) {
-    if (getStoredTokenHashes(entry).includes(tokenHash)) return entry.user;
+    if (getActiveTokenHash(entry) === tokenHash) return entry.user;
   }
   return undefined;
 }
@@ -159,8 +155,9 @@ function hashMcpToken(token: string): string {
   return createHash("sha256").update(token).digest("hex");
 }
 
-function getStoredTokenHashes(entry: StoredMetabaseSession): string[] {
-  return [...new Set([entry.mcpTokenHash, ...(entry.mcpTokenHashes ?? [])].filter(Boolean) as string[])];
+function getActiveTokenHash(entry: StoredMetabaseSession): string | undefined {
+  // Older versions appended tokens to this array. Its last item is the newest token.
+  return entry.mcpTokenHashes?.at(-1) ?? entry.mcpTokenHash;
 }
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {

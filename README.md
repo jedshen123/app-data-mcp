@@ -569,7 +569,7 @@ APP_DATA_REQUIRE_AUTH_TOKEN=true
 APP_DATA_SESSION_FILE=.data/metabase-sessions.json
 ```
 
-个人 MCP token 本身不按时间过期，MCP 也不再使用 `METABASE_SESSION_TTL_HOURS` 主动判定底层 Session 过期。只要 Metabase 接受该 Session，服务就持续使用它。只有 Metabase 实际返回 HTTP 401 时，才返回 `reauth_required`，要求对应账号重新授权以替换平台 Session；重新授权不会使该账号已经配置到客户端的个人 MCP token 失效，也不会自动切换到统一服务账号绕过用户权限。
+个人 MCP token 本身不按时间过期，MCP 也不再使用 `METABASE_SESSION_TTL_HOURS` 主动判定底层 Session 过期。只要 Metabase 接受该 Session，服务就持续使用它。只有 Metabase 实际返回 HTTP 401 时，才返回 `reauth_required`，要求对应账号重新授权以替换平台 Session；同一账号重新授权时会生成新的个人 MCP token，并立即使该账号之前的 token 失效，也不会自动切换到统一服务账号绕过用户权限。
 
 用户首次授权打开：
 

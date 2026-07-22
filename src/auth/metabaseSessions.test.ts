@@ -4,9 +4,9 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { getStoredMetabaseSessionStatus, getUserForMcpToken } from "./metabaseSessions.js";
+import { getStoredMetabaseSessionStatus, getUserForMcpToken, loginMetabaseUser } from "./metabaseSessions.js";
 
-test("personal MCP tokens ignore local session expiry", async (context) => {
+test("only the latest legacy MCP token remains active and ignores local session expiry", async (context) => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "app-data-mcp-auth-"));
   const sessionFile = path.join(directory, "sessions.json");
   const previousSessionFile = process.env.APP_DATA_SESSION_FILE;
@@ -38,7 +38,7 @@ test("personal MCP tokens ignore local session expiry", async (context) => {
     "utf8"
   );
 
-  assert.equal(await getUserForMcpToken(legacyToken), "user@example.com");
+  assert.equal(await getUserForMcpToken(legacyToken), undefined);
   assert.equal(await getUserForMcpToken(currentToken), "user@example.com");
   assert.equal(await getUserForMcpToken("appdata_unknown"), undefined);
   const oldSessionStatus = await getStoredMetabaseSessionStatus("user@example.com");
@@ -64,6 +64,44 @@ test("personal MCP tokens ignore local session expiry", async (context) => {
 
   assert.equal(await getUserForMcpToken(legacyToken), undefined);
   assert.equal(await getUserForMcpToken(currentToken), "user@example.com");
+});
+
+test("reauthorizing an account invalidates its previously issued MCP token", async (context) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "app-data-mcp-auth-"));
+  const sessionFile = path.join(directory, "sessions.json");
+  const previousSessionFile = process.env.APP_DATA_SESSION_FILE;
+  const previousBaseUrl = process.env.METABASE_BASE_URL;
+  const previousFetch = globalThis.fetch;
+  let loginCount = 0;
+  globalThis.fetch = async () => {
+    loginCount += 1;
+    return Response.json({ id: `platform-session-${loginCount}` });
+  };
+  process.env.APP_DATA_SESSION_FILE = sessionFile;
+  process.env.METABASE_BASE_URL = "http://metabase.test";
+
+  context.after(async () => {
+    if (previousSessionFile === undefined) delete process.env.APP_DATA_SESSION_FILE;
+    else process.env.APP_DATA_SESSION_FILE = previousSessionFile;
+    if (previousBaseUrl === undefined) delete process.env.METABASE_BASE_URL;
+    else process.env.METABASE_BASE_URL = previousBaseUrl;
+    globalThis.fetch = previousFetch;
+    await fs.rm(directory, { recursive: true, force: true });
+  });
+
+  const firstLogin = await loginMetabaseUser("User@Example.com", "password");
+  assert.equal(await getUserForMcpToken(firstLogin.mcpToken), "User@Example.com");
+
+  const secondLogin = await loginMetabaseUser("user@example.com", "password");
+  assert.equal(await getUserForMcpToken(firstLogin.mcpToken), undefined);
+  assert.equal(await getUserForMcpToken(secondLogin.mcpToken), "user@example.com");
+
+  const stored = JSON.parse(await fs.readFile(sessionFile, "utf8")) as {
+    sessions: Record<string, { mcpTokenHash?: string; mcpTokenHashes?: string[]; session: string }>;
+  };
+  assert.equal(stored.sessions["user@example.com"].mcpTokenHash, hashToken(secondLogin.mcpToken));
+  assert.equal(stored.sessions["user@example.com"].mcpTokenHashes, undefined);
+  assert.equal(stored.sessions["user@example.com"].session, "platform-session-2");
 });
 
 function hashToken(token: string): string {
