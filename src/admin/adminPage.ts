@@ -95,7 +95,7 @@ export function renderAdminPage(): string {
         <button data-tab="audit">审计日志</button>
       </nav>
       <main>
-        <div class="toolbar"><input id="search" placeholder="按标题或资产 ID 搜索" /><input id="domain-filter" list="domain-options" placeholder="搜索或选择业务域" aria-label="业务域筛选" autocomplete="off" /><datalist id="domain-options"></datalist><select id="type-filter" aria-label="类型筛选"><option value="">全部类型</option></select><select id="published-filter" aria-label="开放状态筛选"><option value="">全部开放状态</option><option value="true">已开放</option><option value="false">未开放</option></select><button id="refresh" class="primary">刷新</button><button id="bulk-open" class="secondary" disabled>批量开放</button><button id="bulk-close" class="secondary" disabled>批量关闭</button><span id="selected-count" class="selected-count"></span></div>
+        <div class="toolbar"><input id="search" placeholder="按标题或资产 ID 搜索" /><input id="domain-filter" list="domain-options" placeholder="搜索或选择业务域" aria-label="业务域筛选" autocomplete="off" /><datalist id="domain-options"></datalist><select id="type-filter" aria-label="类型筛选"><option value="">全部类型</option></select><select id="published-filter" aria-label="开放状态筛选"><option value="">全部开放状态</option><option value="true">已开放</option><option value="false">未开放</option></select><button id="bulk-open" class="secondary" disabled>批量开放</button><button id="bulk-close" class="secondary" disabled>批量关闭</button><span id="selected-count" class="selected-count"></span></div>
         <section id="tool-instructions-panel" class="instructions-panel hidden"><h2>MCP 全局说明 instructions</h2><p class="muted">AI 客户端连接 MCP 时会收到这段全局说明。关键权限和安全限制仍由服务端代码强制执行。</p><textarea id="global-instructions" rows="7" maxlength="20000" aria-label="MCP 全局说明"></textarea><div class="instructions-footer"><span id="instructions-status" class="muted"></span><button id="save-instructions" class="primary">保存全局说明</button></div><details open><summary>当前实际发送给 AI 的说明（包含工具开关状态）</summary><pre id="effective-instructions"></pre></details></section>
         <div class="card"><table id="data-table"><colgroup id="table-columns"></colgroup><thead id="thead"></thead><tbody id="tbody"></tbody></table><div class="pager"><span id="summary"></span><span><button id="prev">上一页</button> <button id="next">下一页</button></span></div></div>
       </main>
@@ -118,12 +118,15 @@ export function renderAdminPage(): string {
     $('login-form').addEventListener('submit',async event=>{event.preventDefault();$('login-error').textContent='';try{const data=await api('/admin/api/login',{method:'POST',body:JSON.stringify({username:$('username').value,password:$('password').value})});state.csrf=data.csrfToken;showApp(data.user);await loadFilters();await load();}catch(error){$('login-error').textContent=error.message;}});
     $('logout').addEventListener('click',async()=>{await api('/admin/api/logout',{method:'POST'}).catch(()=>{});location.reload();});
     document.querySelectorAll('nav button').forEach(button=>button.addEventListener('click',async()=>{document.querySelectorAll('nav button').forEach(item=>item.classList.remove('active'));button.classList.add('active');state.tab=button.dataset.tab;state.offset=0;state.selected.clear();const assetTab=state.tab==='metabase'||state.tab==='posthog';$('search').placeholder=state.tab==='audit'?'按用户邮箱搜索':state.tab==='tools'?'按工具名称、标题或描述搜索':'按标题或资产 ID 搜索';$('domain-filter').classList.toggle('hidden',!assetTab);$('type-filter').classList.toggle('hidden',!assetTab);$('published-filter').classList.toggle('hidden',!assetTab);$('tool-instructions-panel').classList.toggle('hidden',state.tab!=='tools');updateBulkActions();if(assetTab)await loadFilters();await load();}));
-    $('refresh').addEventListener('click',()=>{state.offset=0;load();});
-    $('search').addEventListener('keydown',event=>{if(event.key==='Enter'){state.offset=0;load();}});
-    $('domain-filter').addEventListener('change',()=>{state.offset=0;state.selected.clear();updateBulkActions();loadAssets();});
-    $('domain-filter').addEventListener('keydown',event=>{if(event.key==='Enter'){event.preventDefault();state.offset=0;state.selected.clear();updateBulkActions();loadAssets();}});
-    $('type-filter').addEventListener('change',()=>{state.offset=0;state.selected.clear();updateBulkActions();loadAssets();});
-    $('published-filter').addEventListener('change',()=>{state.offset=0;state.selected.clear();updateBulkActions();loadAssets();});
+    let filterTimer;
+    function scheduleFilterLoad(delay=0){clearTimeout(filterTimer);filterTimer=setTimeout(()=>{state.offset=0;if(state.tab==='metabase'||state.tab==='posthog'){state.selected.clear();updateBulkActions();}load();},delay);}
+    $('search').addEventListener('input',()=>scheduleFilterLoad(300));
+    $('search').addEventListener('keydown',event=>{if(event.key==='Enter'){event.preventDefault();scheduleFilterLoad();}});
+    $('domain-filter').addEventListener('input',()=>scheduleFilterLoad(300));
+    $('domain-filter').addEventListener('change',()=>scheduleFilterLoad());
+    $('domain-filter').addEventListener('keydown',event=>{if(event.key==='Enter'){event.preventDefault();scheduleFilterLoad();}});
+    $('type-filter').addEventListener('change',()=>scheduleFilterLoad());
+    $('published-filter').addEventListener('change',()=>scheduleFilterLoad());
     $('prev').addEventListener('click',()=>{state.offset=Math.max(0,state.offset-state.limit);load();});
     $('next').addEventListener('click',()=>{if(state.offset+state.limit<state.total){state.offset+=state.limit;load();}});
     async function load(){if(state.tab==='audit')await loadAudit();else if(state.tab==='tools')await loadTools();else await loadAssets();}

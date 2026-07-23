@@ -160,7 +160,7 @@ export async function listManagedAssets(input: {
   await ensureMetadataTable(client);
   const config = getMetadataConfig();
   const tableName = qualifiedName(config.schema, config.table);
-  const conditions: string[] = [];
+  const conditions: string[] = ["is_active = true"];
   const values: unknown[] = [];
   if (input.platform) {
     values.push(input.platform);
@@ -223,7 +223,7 @@ export async function listManagedAssetDomains(platform?: DataPlatform): Promise<
   const config = getMetadataConfig();
   const tableName = qualifiedName(config.schema, config.table);
   const values: unknown[] = [];
-  const where = platform ? "where platform = $1" : "";
+  const where = platform ? "where is_active = true and platform = $1" : "where is_active = true";
   if (platform) values.push(platform);
   const result = await client.query<{ business_domain: string }>(
     `select distinct coalesce(admin_overrides->>'businessDomain', metadata->>'businessDomain') as business_domain
@@ -241,7 +241,7 @@ export async function listManagedAssetTypes(platform?: DataPlatform): Promise<Da
   const config = getMetadataConfig();
   const tableName = qualifiedName(config.schema, config.table);
   const values: unknown[] = [];
-  const where = platform ? "where platform = $1" : "";
+  const where = platform ? "where is_active = true and platform = $1" : "where is_active = true";
   if (platform) values.push(platform);
   const result = await client.query<{ asset_type: DataAssetType }>(
     `select distinct asset_type from ${tableName} ${where} order by asset_type asc`,
