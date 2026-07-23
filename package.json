@@ -15,7 +15,7 @@
     "test:starrocks": "npm run build && node --test dist/connectors/starrocks.test.js",
     "test:semantic": "npm run build && node --test dist/connectors/metabaseSemantic.test.js",
     "test:audience": "npm run build && node --test dist/connectors/metabaseAudience.test.js dist/audienceExports.test.js",
-    "test:governance": "npm run build && node --test dist/queryGovernance.test.js dist/assetSelectionGovernance.test.js dist/catalogSearch.test.js",
+    "test:governance": "npm run build && node --test dist/queryGovernance.test.js dist/assetSelectionGovernance.test.js dist/catalogSearch.test.js dist/accessPolicy.test.js dist/sync/metabaseCollections.test.js",
     "start": "node dist/server.js",
     "start:http": "node dist/http.js",
     "check": "tsc --noEmit -p tsconfig.json"

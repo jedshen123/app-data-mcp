@@ -11,6 +11,7 @@ import type {
   SourceRef
 } from "../types.js";
 import { asArray, fetchJson, getNumber, getObject, getString, joinUrl } from "./http.js";
+import { indexMetabaseCollections, resolveMetabaseCollectionName } from "./metabaseCollections.js";
 
 type MetabaseClient = {
   baseUrl: string;
@@ -89,12 +90,16 @@ async function createMetabaseClient(syncConfig: Exclude<typeof config, { mode: "
 }
 
 async function syncMetabaseAssets(client: MetabaseClient): Promise<DataAsset[]> {
-  const [dashboardsRaw, cardsRaw] = await Promise.all([
+  const [dashboardsRaw, cardsRaw, collectionsRaw] = await Promise.all([
     getMetabaseList(client, "/api/dashboard"),
-    getMetabaseList(client, "/api/card")
+    getMetabaseList(client, "/api/card"),
+    readMetabaseCollections(client)
   ]);
+  const collectionsById = indexMetabaseCollections(collectionsRaw);
 
-  const dashboards = await Promise.all(dashboardsRaw.map((dashboard) => toDashboardAsset(client, dashboard)));
+  const dashboards = await Promise.all(
+    dashboardsRaw.map((dashboard) => toDashboardAsset(client, dashboard, collectionsById))
+  );
   const detailedCards = await mapWithConcurrency(cardsRaw, CARD_DETAIL_CONCURRENCY, async (card) => {
     const id = String(getNumber(card.id) ?? getString(card.id) ?? "");
     const detail = id ? await readCardDetail(client, id) : undefined;
@@ -120,7 +125,8 @@ async function syncMetabaseAssets(client: MetabaseClient): Promise<DataAsset[]> 
   const cards = detailedCards.map(({ card, detailLoaded }) => toCardAsset(client, card, {
     detailLoaded,
     cardsById,
-    tablesById
+    tablesById,
+    collectionsById
   }));
   populateMetricDownstreamAssets(cards, detailedCards.map(({ card }) => card));
   return [...dashboards, ...cards];
@@ -133,16 +139,30 @@ async function getMetabaseList(client: MetabaseClient, pathname: string): Promis
   return asArray<Record<string, unknown>>(value);
 }
 
-async function toDashboardAsset(client: MetabaseClient, dashboard: Record<string, unknown>): Promise<DataAsset> {
+async function readMetabaseCollections(client: MetabaseClient): Promise<Record<string, unknown>[]> {
+  try {
+    return await getMetabaseList(client, "/api/collection");
+  } catch (error) {
+    console.warn("Unable to read Metabase collections; business domains will use embedded collection metadata only.", error);
+    return [];
+  }
+}
+
+async function toDashboardAsset(
+  client: MetabaseClient,
+  dashboard: Record<string, unknown>,
+  collectionsById: Map<number, Record<string, unknown>>
+): Promise<DataAsset> {
   const id = String(getNumber(dashboard.id) ?? getString(dashboard.id) ?? "");
-  const name = getString(dashboard.name) ?? getString(dashboard.title) ?? `Metabase dashboard ${id}`;
-  const description = getString(dashboard.description);
-  const collection = getObject(dashboard.collection);
   const detail = await readDashboardDetail(client, id);
+  const metadata = detail ? { ...dashboard, ...detail } : dashboard;
+  const name = getString(metadata.name) ?? getString(metadata.title) ?? `Metabase dashboard ${id}`;
+  const description = getString(metadata.description);
+  const collectionName = resolveMetabaseCollectionName(metadata, collectionsById);
   const children = readDashboardChildren(detail);
   const parameters = readMetabaseDashboardParameters(detail);
   const dashboardParameterMappings = readMetabaseDashboardParameterMappings(detail, parameters);
-  const dashboardId = getNumber(dashboard.id);
+  const dashboardId = getNumber(metadata.id);
 
   return {
     id: `metabase:dashboard:${id}`,
@@ -150,11 +170,11 @@ async function toDashboardAsset(client: MetabaseClient, dashboard: Record<string
     type: "dashboard",
     title: name,
     description,
-    businessDomain: getString(collection?.name),
-    tags: compact(["metabase", "dashboard", getString(collection?.name)]),
-    owner: getCreatorName(dashboard),
+    businessDomain: collectionName,
+    tags: compact(["metabase", "dashboard", collectionName]),
+    owner: getCreatorName(metadata),
     url: joinUrl(client.publicUrl, `/dashboard/${id}`),
-    updatedAt: getString(dashboard.updated_at) ?? getString(dashboard.created_at),
+    updatedAt: getString(metadata.updated_at) ?? getString(metadata.created_at),
     children,
     parameters,
     dashboardParameterMappings,
@@ -164,9 +184,9 @@ async function toDashboardAsset(client: MetabaseClient, dashboard: Record<string
         url: joinUrl(client.publicUrl, `/dashboard/${id}`)
       }
     ],
-    access: buildMetabaseAccessSnapshot(dashboard, {
+    access: buildMetabaseAccessSnapshot(metadata, {
       dashboardId
-    }),
+    }, collectionName),
     warnings: ["Synced metadata only. This MCP does not write to Metabase."]
   };
 }
@@ -272,6 +292,7 @@ function toCardAsset(
     detailLoaded: boolean;
     cardsById: Map<string, Record<string, unknown>>;
     tablesById: Map<string, Record<string, unknown> | undefined>;
+    collectionsById: Map<number, Record<string, unknown>>;
   }
 ): DataAsset {
   const id = String(getNumber(card.id) ?? getString(card.id) ?? "");
@@ -280,7 +301,7 @@ function toCardAsset(
   const nativeQuery = getObject(datasetQuery?.native);
   const queryText = getString(nativeQuery?.query) ?? JSON.stringify(datasetQuery ?? {}, null, 2);
   const columns = readMetabaseColumns(card);
-  const collection = getObject(card.collection);
+  const collectionName = resolveMetabaseCollectionName(card, options.collectionsById);
   const parameters = readMetabaseCardParameters(card);
   const dashboardId =
     getNumber(card.dashboard_id) ??
@@ -307,8 +328,8 @@ function toCardAsset(
     type: assetType,
     title: name,
     description: getString(card.description),
-    businessDomain: getString(collection?.name),
-    tags: compact(["metabase", assetType, getString(card.display), getString(collection?.name)]),
+    businessDomain: collectionName,
+    tags: compact(["metabase", assetType, getString(card.display), collectionName]),
     owner: getCreatorName(card),
     url: joinUrl(client.publicUrl, `/${route}/${id}`),
     updatedAt: getString(card.updated_at) ?? getString(card.created_at),
@@ -331,7 +352,7 @@ function toCardAsset(
     ],
     access: buildMetabaseAccessSnapshot(card, {
       dashboardId
-    }),
+    }, collectionName),
     warnings: compact([
       "Synced metadata only. Query execution remains read-only and row-limited.",
       options.detailLoaded
@@ -449,7 +470,8 @@ function pickRaw(value: Record<string, unknown>, keys: string[]): Record<string,
 
 function buildMetabaseAccessSnapshot(
   value: Record<string, unknown>,
-  extra: { dashboardId?: number }
+  extra: { dashboardId?: number },
+  resolvedCollectionName?: string
 ): DataAccessSnapshot {
   const now = new Date().toISOString();
   const syncFreshness = getSyncFreshnessConfig();
@@ -479,7 +501,7 @@ function buildMetabaseAccessSnapshot(
     syncedAt: now,
     visibility,
     collectionId,
-    collectionName: getString(collection?.name),
+    collectionName: resolvedCollectionName ?? getString(collection?.name),
     collectionPersonalOwnerId: personalOwnerId,
     collectionPersonalOwnerEmail: personalOwnerEmail,
     dashboardId: extra.dashboardId,

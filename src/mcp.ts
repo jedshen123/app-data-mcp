@@ -4,6 +4,7 @@ import { z } from "zod";
 import {
   canReadAssetMetadataFromSnapshot,
   canReadAssetMetadataLive,
+  filterAssetsByLiveAccess,
   filterAssetsBySnapshotAccess
 } from "./accessPolicy.js";
 import { auditToolCall, type AuditDetails } from "./audit.js";
@@ -77,10 +78,13 @@ export async function createAppDataMcpServer() {
 
         const requestContext = getRequestContext();
         const requestedLimit = input.limit ?? limits.defaultSearchLimit;
-        const assets = orderAssetsByGovernancePriority(filterAssetsBySnapshotAccess(
+        const snapshotVisibleAssets = filterAssetsBySnapshotAccess(
           await catalog.search({ ...input, limit: limits.maxSearchLimit }),
           requestContext.user
-        )).slice(0, requestedLimit);
+        );
+        const assets = orderAssetsByGovernancePriority(
+          await filterAssetsByLiveAccess(snapshotVisibleAssets)
+        ).slice(0, requestedLimit);
         const selection = buildAssetSelectionSummary(assets);
         return toTextPayload({
           assets: assets.map((asset, index) => ({
@@ -89,7 +93,7 @@ export async function createAppDataMcpServer() {
           })),
           count: assets.length,
           selection,
-          note: "Results come from published PostgreSQL metadata and are filtered by access snapshots. Use get_asset, trace_asset, or run_asset with an id for details.",
+          note: "Results come from published PostgreSQL metadata and are filtered by synchronized snapshots plus the current user's live Metabase permissions. Use get_asset, trace_asset, or run_asset with an id for details.",
           nextSteps: [
             "Inspect matching Metric candidates with get_asset before selecting a Model. For Metabase Metrics, preserve metric.formula and use semantic.filters/breakouts.",
             "Do not use Model aggregations to recreate a Metric. Model aggregation fallback requires the original question plus rejected_asset_ids and a concrete fallback_reason.",
