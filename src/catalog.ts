@@ -1,6 +1,8 @@
 import { z } from "zod";
+import { cardSemanticMetadataSchema } from "./cardSemantic.js";
+import { modelSemanticMetadataSchema } from "./modelSemantic.js";
 import { getDataLimitConfig, getMetabasePublicUrl, getMetadataConfig } from "./config.js";
-import { readPublishedCatalog } from "./metadataStore.js";
+import { readActiveAsset, readPublishedCatalog } from "./metadataStore.js";
 import type { AssetCatalog, DataAsset, DataAssetType, DataPlatform } from "./types.js";
 
 const columnSchema = z.object({
@@ -115,6 +117,8 @@ const assetSchema = z.object({
   parameters: z.array(parameterSchema).optional(),
   dashboardParameterMappings: z.array(dashboardParameterMappingSchema).optional(),
   metric: metricMetadataSchema.optional(),
+  semantic: cardSemanticMetadataSchema.optional(),
+  modelSemantic: modelSemanticMetadataSchema.optional(),
   audience: audienceMetadataSchema.optional(),
   access: accessSnapshotSchema.optional(),
   warnings: z.array(z.string()).optional()
@@ -132,6 +136,11 @@ export type SearchAssetsInput = {
   type?: DataAssetType;
   domain?: string;
   limit?: number;
+};
+
+export type ResolvedAsset = {
+  asset: DataAsset;
+  inheritedFromDashboards: DataAsset[];
 };
 
 export class CatalogStore {
@@ -158,6 +167,24 @@ export class CatalogStore {
     return catalog.assets.find((asset) => asset.id === id);
   }
 
+  async resolveById(id: string): Promise<ResolvedAsset | undefined> {
+    const catalog = await this.getCatalog();
+    const publishedAsset = catalog.assets.find((asset) => asset.id === id);
+    if (publishedAsset) {
+      return { asset: publishedAsset, inheritedFromDashboards: [] };
+    }
+
+    const inheritedFromDashboards = findPublishedDashboardParents(catalog.assets, id);
+    if (!inheritedFromDashboards.length) return undefined;
+
+    const child = await readActiveAsset(id);
+    if (!isInheritableMetabaseDashboardChild(child)) return undefined;
+    return {
+      asset: rewriteAssetPublicUrl(child),
+      inheritedFromDashboards
+    };
+  }
+
   async listDomains(): Promise<string[]> {
     const catalog = await this.getCatalog();
     return Array.from(
@@ -168,17 +195,14 @@ export class CatalogStore {
   async status() {
     try {
       const catalog = await this.getCatalog();
-      const byPlatform = countBy(catalog.assets, (asset) => asset.platform);
-      const byType = countBy(catalog.assets, (asset) => asset.type);
+      const summary = summarizeCatalogAssets(catalog.assets);
 
       return {
         initialized: true,
         path: this.path,
         version: catalog.version,
         updatedAt: catalog.updatedAt,
-        assetCount: catalog.assets.length,
-        byPlatform,
-        byType
+        ...summary
       };
     } catch (error) {
       return {
@@ -200,6 +224,14 @@ export class CatalogStore {
   }
 }
 
+export function summarizeCatalogAssets(assets: DataAsset[]) {
+  return {
+    assetCount: assets.length,
+    byPlatform: countBy(assets, (asset) => asset.platform),
+    byType: countBy(assets, (asset) => asset.type)
+  };
+}
+
 export function searchCatalogAssets(assets: DataAsset[], input: SearchAssetsInput, limit: number): DataAsset[] {
   const signals = buildSearchSignals(input.query);
   return assets
@@ -214,6 +246,19 @@ export function searchCatalogAssets(assets: DataAsset[], input: SearchAssetsInpu
     .sort((left, right) => right.score - left.score || left.asset.title.localeCompare(right.asset.title, "zh-CN"))
     .slice(0, limit)
     .map(({ asset }) => asset);
+}
+
+export function findPublishedDashboardParents(assets: DataAsset[], childAssetId: string): DataAsset[] {
+  return assets.filter((asset) =>
+    asset.platform === "metabase" &&
+    asset.type === "dashboard" &&
+    asset.children?.includes(childAssetId)
+  );
+}
+
+function isInheritableMetabaseDashboardChild(asset: DataAsset | undefined): asset is DataAsset {
+  return asset?.platform === "metabase" &&
+    (asset.type === "card" || asset.type === "model" || asset.type === "metric");
 }
 
 function countBy<T>(items: T[], getKey: (item: T) => string): Record<string, number> {
@@ -269,6 +314,23 @@ function scoreAsset(asset: DataAsset, signals: SearchSignals): number {
     asset.metric?.dimensions?.map((column) => `${column.name} ${column.displayName ?? ""} ${column.description ?? ""}`).join(" "),
     asset.metric?.queryDescription
   ].filter(Boolean).join(" "));
+  const semantic = normalize([
+    asset.semantic?.role,
+    asset.semantic?.baseGrain.join(" "),
+    asset.semantic?.defaultTimeDimension
+      ? `${asset.semantic.defaultTimeDimension.field} ${asset.semantic.defaultTimeDimension.label ?? ""} ${asset.semantic.defaultTimeDimension.dateMeaning ?? ""}`
+      : undefined,
+    asset.semantic?.dimensions.map((dimension) =>
+      `${dimension.field} ${dimension.label ?? ""} ${dimension.description ?? ""} ${(dimension.synonyms ?? []).join(" ")}`
+    ).join(" "),
+    asset.semantic?.measures.map((measure) =>
+      `${measure.name} ${measure.sourceColumn ?? ""} ${measure.label ?? ""} ${measure.description ?? ""} ${measure.unit ?? ""} ${(measure.synonyms ?? []).join(" ")} ${measure.rollup.formula?.numerator ?? ""} ${measure.rollup.formula?.denominator ?? ""}`
+    ).join(" "),
+    asset.modelSemantic?.baseGrain?.join(" "),
+    asset.modelSemantic?.entityFields?.join(" "),
+    asset.modelSemantic?.additiveFields?.join(" "),
+    asset.modelSemantic?.primaryTimeField
+  ].filter(Boolean).join(" "));
   let matchedTokens = 0;
   let score = popularity / 10;
   if (signals.normalizedQuery && `${title} ${description}`.includes(signals.normalizedQuery)) score += 80;
@@ -279,6 +341,7 @@ function scoreAsset(asset: DataAsset, signals: SearchSignals): number {
     if (description.includes(token)) { score += 10; matched = true; }
     if (domain.includes(token)) { score += 8; matched = true; }
     if (fields.includes(token)) { score += 5; matched = true; }
+    if (semantic.includes(token)) { score += 14; matched = true; }
     if (queryText.includes(token)) { score += 2; matched = true; }
     if (matched) matchedTokens += 1;
   }
@@ -286,7 +349,7 @@ function scoreAsset(asset: DataAsset, signals: SearchSignals): number {
   if (matchedTokens < minimumMatches) return 0;
   if (asset.type === "metric") score += 18;
   else if (asset.type === "model") score += 10;
-  else if (asset.type === "card") score += 4;
+  else if (asset.type === "card") score += asset.semantic?.role === "metric_set" ? 14 : 4;
   return score + (matchedTokens / signals.tokens.length) * 20;
 }
 
@@ -296,17 +359,20 @@ function rewriteCatalogPublicUrls(catalog: AssetCatalog): AssetCatalog {
 
   return {
     ...catalog,
-    assets: catalog.assets.map((asset) => {
-      if (asset.platform !== "metabase") return asset;
-      return {
-        ...asset,
-        url: rewriteUrlBase(asset.url, metabasePublicUrl),
-        sourceRefs: asset.sourceRefs?.map((sourceRef) => ({
-          ...sourceRef,
-          url: sourceRef.url ? rewriteUrlBase(sourceRef.url, metabasePublicUrl) : sourceRef.url
-        }))
-      };
-    })
+    assets: catalog.assets.map(rewriteAssetPublicUrl)
+  };
+}
+
+function rewriteAssetPublicUrl(asset: DataAsset): DataAsset {
+  const metabasePublicUrl = getMetabasePublicUrl();
+  if (!metabasePublicUrl || asset.platform !== "metabase") return asset;
+  return {
+    ...asset,
+    url: rewriteUrlBase(asset.url, metabasePublicUrl),
+    sourceRefs: asset.sourceRefs?.map((sourceRef) => ({
+      ...sourceRef,
+      url: sourceRef.url ? rewriteUrlBase(sourceRef.url, metabasePublicUrl) : sourceRef.url
+    }))
   };
 }
 

@@ -54,6 +54,100 @@ export type SemanticQuery = {
   breakouts?: SemanticBreakout[];
   fields?: string[];
   aggregations?: SemanticAggregation[];
+  measures?: string[];
+  cumulative?: SemanticCumulative[];
+};
+
+export type SemanticCumulative = {
+  measure: string;
+  orderBy: string;
+  partitionBy?: string[];
+  alias?: string;
+};
+
+export type SemanticTimeUnit = "minute" | "hour" | "day" | "week" | "month" | "quarter" | "year";
+
+export type TimeDimensionMetadata = {
+  field: string;
+  label?: string;
+  defaultUnit?: SemanticTimeUnit;
+  supportedUnits?: SemanticTimeUnit[];
+  timezone?: string;
+  dateMeaning?: string;
+};
+
+export type CardSemanticDimension = {
+  field: string;
+  label?: string;
+  description?: string;
+  synonyms?: string[];
+  supportedUnits?: SemanticTimeUnit[];
+};
+
+export type CardMeasureFormula = {
+  operator: "divide";
+  numerator: string;
+  denominator: string;
+  zeroDivision?: "null";
+  scale?: number;
+};
+
+export type CardMeasureRollup = {
+  strategy: "sum" | "min" | "max" | "recompute" | "forbidden";
+  allowedGroupBy?: string[];
+  allowedTimeUnits?: SemanticTimeUnit[];
+  formula?: CardMeasureFormula;
+  reason?: string;
+};
+
+export type CardMeasureCumulative = {
+  supported: boolean;
+  strategy?: "running_sum" | "precomputed";
+  reason?: string;
+  alternativeAssetId?: string;
+};
+
+export type CardSemanticMeasure = {
+  name: string;
+  label?: string;
+  sourceColumn?: string;
+  description?: string;
+  valueType?: string;
+  unit?: string;
+  synonyms?: string[];
+  timeDimension?: TimeDimensionMetadata;
+  rollup: CardMeasureRollup;
+  cumulative?: CardMeasureCumulative;
+};
+
+export type CardSemanticMetadata = {
+  role: "metric_set";
+  baseGrain: string[];
+  defaultTimeDimension?: TimeDimensionMetadata;
+  dimensions: CardSemanticDimension[];
+  measures: CardSemanticMeasure[];
+  execution?: {
+    mode: "precomputed" | "cached" | "live_query" | "unknown";
+    freshness?: {
+      updateFrequency?: string;
+      maxDelayHours?: number;
+      dataThrough?: string;
+    };
+    cost?: {
+      tier?: "low" | "medium" | "high";
+      expectedP95Ms?: number;
+    };
+  };
+};
+
+export type ModelSemanticMetadata = {
+  role: "detail_dataset";
+  aggregationPolicy: "detail_only" | "guarded";
+  baseGrain?: string[];
+  primaryTimeField?: string;
+  entityFields?: string[];
+  additiveFields?: string[];
+  requiredFilters?: SemanticFilter[];
 };
 
 export type SourceRef = {
@@ -156,6 +250,7 @@ export type DataAsset = {
   id: string;
   platform: DataPlatform;
   type: DataAssetType;
+  analysisType?: string;
   title: string;
   description?: string;
   businessDomain?: string;
@@ -172,6 +267,8 @@ export type DataAsset = {
   parameters?: AssetParameter[];
   dashboardParameterMappings?: DashboardParameterMapping[];
   metric?: MetricMetadata;
+  semantic?: CardSemanticMetadata;
+  modelSemantic?: ModelSemanticMetadata;
   audience?: AudienceMetadata;
   access?: DataAccessSnapshot;
   warnings?: string[];

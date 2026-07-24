@@ -117,7 +117,8 @@ export function getToolManagementConfig() {
   return {
     schema: process.env.DB_SCHEMA ?? "public",
     table: process.env.MCP_TOOLS_TABLE ?? "app_data_mcp_tools",
-    settingsTable: process.env.MCP_SETTINGS_TABLE ?? "app_data_mcp_settings"
+    settingsTable: process.env.MCP_SETTINGS_TABLE ?? "app_data_mcp_settings",
+    permissionsTable: process.env.MCP_TOOL_PERMISSIONS_TABLE ?? "app_data_mcp_tool_permissions"
   };
 }
 

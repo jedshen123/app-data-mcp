@@ -14,7 +14,7 @@ export async function runLiveAsset(asset: DataAsset, options: RunOptions) {
   }
 
   if (asset.platform === "posthog") {
-    if (options.semantic) throw new Error("semantic_query_not_supported: Semantic controls are currently limited to Metabase Model and Metric assets.");
+    if (options.semantic) throw new Error("semantic_query_not_supported: Semantic controls are currently limited to Metabase Model, Metric, and governed metric_set Card assets.");
     return runPostHogAsset(asset, options);
   }
 

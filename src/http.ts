@@ -5,6 +5,7 @@ import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js
 import express from "express";
 import { registerAudienceExportRoutes } from "./audienceExports.js";
 import { registerAdminRoutes } from "./admin/adminRoutes.js";
+import { identifyAiClient, identifyAiClientVersion } from "./aiClient.js";
 import { registerLoginRoutes } from "./auth/loginRoutes.js";
 import { getUserForMcpToken } from "./auth/metabaseSessions.js";
 import { getHttpConfig } from "./config.js";
@@ -66,7 +67,8 @@ app.use("/mcp", async (req, res, next) => {
 });
 
 app.post("/mcp", async (req, res) => {
-  const server = await createAppDataMcpServer();
+  const requestUser = typeof res.locals.appDataUser === "string" ? res.locals.appDataUser : undefined;
+  const server = await createAppDataMcpServer({ user: requestUser });
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true
@@ -76,11 +78,12 @@ app.post("/mcp", async (req, res) => {
     await withRequestContext(
       {
         requestId: randomUUID(),
-        user: typeof res.locals.appDataUser === "string" ? res.locals.appDataUser : undefined,
+        user: requestUser,
         groups: splitHeader(req.header("x-app-data-groups")),
         metabaseSession: req.header("x-metabase-session") ?? undefined,
-        authMethod: typeof res.locals.appDataUser === "string" ? "mcp-token" : "none",
+        authMethod: requestUser ? "mcp-token" : "none",
         aiClient: getAiClient(req),
+        aiClientVersion: getAiClientVersion(req),
         clientIp: getClientIp(req),
         userAgent: req.header("user-agent") ?? undefined
       },
@@ -128,15 +131,18 @@ function getClientIp(req: express.Request): string | undefined {
 }
 
 function getAiClient(req: express.Request): string {
-  const explicitClient = req.header("x-app-data-client")?.trim();
-  if (explicitClient) return explicitClient;
+  return identifyAiClient(
+    req.header("x-app-data-client"),
+    req.header("user-agent")
+  );
+}
 
-  const userAgent = req.header("user-agent")?.toLowerCase() ?? "";
-  if (userAgent.includes("claude")) return "claude-code";
-  if (userAgent.includes("codex")) return "codex";
-  if (userAgent.includes("cursor")) return "cursor";
-  if (userAgent.includes("windsurf")) return "windsurf";
-  return "unknown";
+function getAiClientVersion(req: express.Request): string | undefined {
+  return identifyAiClientVersion(
+    req.header("x-app-data-client-version"),
+    req.header("user-agent"),
+    getAiClient(req)
+  );
 }
 
 app.get("/mcp", (_req, res) => {

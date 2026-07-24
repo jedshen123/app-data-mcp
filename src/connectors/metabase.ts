@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { validateCardSemanticAgainstAsset } from "../cardSemantic.js";
+import { validateModelSemanticAgainstAsset } from "../modelSemantic.js";
 import { getAuthConfig, getMetabaseConfig } from "../config.js";
 import { getMetabaseLoginUrl } from "../auth/loginRoutes.js";
 import { getStoredMetabaseSession } from "../auth/metabaseSessions.js";
@@ -13,8 +15,11 @@ import type {
   DataAsset,
   SemanticAggregation,
   SemanticBreakout,
+  SemanticCumulative,
   SemanticFilter,
-  SemanticQuery
+  SemanticQuery,
+  CardSemanticMeasure,
+  TimeDimensionMetadata
 } from "../types.js";
 import { fetchJson, getNumber, getObject, getString, isObject, joinUrl } from "../sync/http.js";
 
@@ -45,15 +50,18 @@ type AudienceRunOptions = {
 };
 
 export async function runMetabaseAsset(asset: DataAsset, options: RunOptions) {
-  if (options.semantic && (asset.type !== "model" && asset.type !== "metric")) {
-    throw new Error(`semantic_query_not_supported: Dynamic semantic queries require a Metabase Model or Metric, got ${asset.type}.`);
+  if (options.semantic && asset.type === "card" && asset.semantic?.role !== "metric_set") {
+    throw new Error("semantic_query_not_supported: Dynamic semantic queries require a Model, Metric, or a Card governed as semantic.role=metric_set.");
+  }
+  if (options.semantic && !["card", "model", "metric"].includes(asset.type)) {
+    throw new Error(`semantic_query_not_supported: Dynamic semantic queries are not supported for ${asset.type}.`);
   }
   const client = await createMetabaseClient();
   if (asset.type === "card" || asset.type === "model" || asset.type === "metric") {
     const cardId = getAssetNumericId(asset.id);
     const semanticQuery = options.semantic;
     if (semanticQuery && options.params && Object.keys(options.params).length > 0) {
-      throw new Error("semantic_query_params_conflict: Use semantic.filters for a dynamic Model/Metric query; params cannot be combined with semantic controls.");
+      throw new Error("semantic_query_params_conflict: Use semantic.filters for a dynamic semantic query; params cannot be combined with semantic controls.");
     }
     const result = semanticQuery
       ? await runMetabaseSemanticQuery(client, asset, semanticQuery, options.limit)
@@ -69,7 +77,7 @@ export async function runMetabaseAsset(asset: DataAsset, options: RunOptions) {
       warnings: [
         ...(asset.warnings ?? []),
         semanticQuery
-          ? `Live ${asset.type} data returned from a validated read-only semantic query.`
+          ? `Live ${asset.type} data returned from a validated read-only semantic query.${semanticQuery.cumulative?.length ? " Running cumulative values were calculated over the complete bounded result." : ""}`
           : `Live ${asset.type} data returned from Metabase using a read-only card query endpoint.`,
         ...(result.truncated ? [`Result truncated to ${options.limit} rows.`] : [])
       ]
@@ -266,15 +274,19 @@ async function runMetabaseSemanticQuery(
     },
     body: JSON.stringify(query)
   });
-  return normalizeDatasetResponse(value, limit);
+  const result = normalizeDatasetResponse(value, limit);
+  return asset.type === "card" && semantic.cumulative?.length
+    ? applyCardCumulative(result, semantic.cumulative, asset)
+    : result;
 }
 
 export function buildMetabaseSemanticQuery(asset: DataAsset, semantic: SemanticQuery, limit: number): Record<string, unknown> {
-  if (asset.platform !== "metabase" || (asset.type !== "model" && asset.type !== "metric")) {
-    throw new Error(`semantic_query_not_supported: Expected a Metabase Model or Metric, got ${asset.platform}:${asset.type}.`);
+  if (asset.platform !== "metabase" || !["card", "model", "metric"].includes(asset.type)) {
+    throw new Error(`semantic_query_not_supported: Expected a Metabase Model, Metric, or governed Card, got ${asset.platform}:${asset.type}.`);
   }
   if (!Number.isInteger(limit) || limit < 1) throw new Error("semantic_query_invalid_limit: limit must be a positive integer.");
   validateSemanticQueryShape(semantic);
+  if (asset.type === "card") return buildMetricSetCardQuery(asset, semantic, limit);
   const availableDimensions = asset.type === "metric" ? asset.metric?.dimensions ?? [] : asset.columns ?? [];
   if (!availableDimensions.length) {
     throw new Error("semantic_metadata_missing: No synchronized dimensions are available. Run npm run sync:metabase before using semantic controls.");
@@ -308,7 +320,12 @@ export function buildMetabaseSemanticQuery(asset: DataAsset, semantic: SemanticQ
     "source-card": Number(getAssetNumericId(asset.id)),
     limit: limit + 1
   };
-  appendSemanticFilters(stage, semantic.filters, availableDimensions);
+  validateModelSemanticAgainstAsset(asset);
+  appendSemanticFilters(
+    stage,
+    mergeSemanticFilters(asset.modelSemantic?.requiredFilters, semantic.filters),
+    availableDimensions
+  );
 
   const aggregations = semantic.aggregations ?? [];
   const breakouts = semantic.breakouts ?? [];
@@ -316,6 +333,7 @@ export function buildMetabaseSemanticQuery(asset: DataAsset, semantic: SemanticQ
     throw new Error("semantic_model_aggregation_required: Model breakouts require at least one aggregation.");
   }
   if (aggregations.length) {
+    validateModelAggregations(asset, aggregations);
     if (semantic.fields?.length) throw new Error("semantic_model_fields_conflict: fields cannot be combined with aggregations.");
     stage.aggregation = aggregations.map((aggregation) => buildAggregation(aggregation, availableDimensions));
     if (breakouts.length) stage.breakout = breakouts.map((breakout) => buildBreakout(breakout, availableDimensions));
@@ -328,6 +346,357 @@ export function buildMetabaseSemanticQuery(asset: DataAsset, semantic: SemanticQ
     database,
     stages: [stage]
   };
+}
+
+function validateModelAggregations(asset: DataAsset, aggregations: SemanticAggregation[]): void {
+  const modelSemantic = asset.modelSemantic;
+  if (!modelSemantic || modelSemantic.aggregationPolicy === "detail_only") {
+    throw new Error(
+      "semantic_model_aggregation_disabled: Model defaults to detail-only queries. "
+      + "Configure modelSemantic.aggregationPolicy=guarded and declare governed fields before aggregating."
+    );
+  }
+  const baseGrain = new Set((modelSemantic.baseGrain ?? []).map(normalizeFieldName));
+  const entityFields = new Set((modelSemantic.entityFields ?? []).map(normalizeFieldName));
+  const additiveFields = new Set((modelSemantic.additiveFields ?? []).map(normalizeFieldName));
+  for (const aggregation of aggregations) {
+    const field = aggregation.field ? normalizeFieldName(aggregation.field) : undefined;
+    if (aggregation.operator === "count") {
+      if (!baseGrain.size) {
+        throw new Error("semantic_model_count_not_governed: Declare modelSemantic.baseGrain before using count.");
+      }
+      continue;
+    }
+    if (!field) throw new Error(`semantic_model_aggregation_field_required: ${aggregation.operator} requires a field.`);
+    if (aggregation.operator === "distinct" && !entityFields.has(field)) {
+      throw new Error(`semantic_model_distinct_not_governed: ${aggregation.field} is not declared in modelSemantic.entityFields.`);
+    }
+    if (aggregation.operator === "sum" && !additiveFields.has(field)) {
+      throw new Error(`semantic_model_sum_not_governed: ${aggregation.field} is not declared in modelSemantic.additiveFields.`);
+    }
+    if (["avg", "min", "max"].includes(aggregation.operator)) {
+      throw new Error(
+        `semantic_model_aggregation_not_governed: ${aggregation.operator} is disabled for Model fallback; use a Metric or Card.`
+      );
+    }
+  }
+}
+
+function mergeSemanticFilters(
+  required: SemanticFilter[] | undefined,
+  requested: SemanticFilter[] | undefined
+): SemanticFilter[] | undefined {
+  const filters = [...(required ?? []), ...(requested ?? [])];
+  if (!filters.length) return undefined;
+  const seen = new Set<string>();
+  return filters.filter((filter) => {
+    const key = JSON.stringify([normalizeFieldName(filter.field), filter.operator, filter.value]);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function buildMetricSetCardQuery(asset: DataAsset, semantic: SemanticQuery, limit: number): Record<string, unknown> {
+  if (!asset.semantic || asset.semantic.role !== "metric_set") {
+    throw new Error("semantic_card_metadata_missing: Card is not governed as semantic.role=metric_set.");
+  }
+  if (semantic.fields !== undefined || semantic.aggregations !== undefined) {
+    throw new Error("semantic_card_contract_immutable: Card metric sets use governed measures; fields and ad-hoc aggregations are not allowed.");
+  }
+  validateCardSemanticAgainstAsset(asset);
+  const database = readAssetDatabaseId(asset);
+  const dimensions = asset.semantic.dimensions.map((dimension) =>
+    resolveDimension(dimension.field, asset.columns ?? [])
+  );
+  const selectedMeasures = resolveCardMeasures(semantic.measures, asset.semantic.measures);
+  const breakouts = semantic.breakouts ?? resolveCardDefaultBreakouts(selectedMeasures, asset.semantic.defaultTimeDimension);
+  const breakoutFields = breakouts.map((breakout) => resolveDimension(breakout.field, dimensions).name);
+  validateCardTimeBreakouts(breakouts, selectedMeasures, asset.semantic);
+  validateCardMeasureRollups(selectedMeasures, breakouts, breakoutFields, asset.semantic.baseGrain);
+  validateCardCumulative(semantic.cumulative, selectedMeasures, breakoutFields, asset.semantic.measures);
+
+  const stage: Record<string, unknown> = {
+    "lib/type": "mbql.stage/mbql",
+    "source-card": Number(getAssetNumericId(asset.id)),
+    limit: limit + 1,
+    aggregation: selectedMeasures.map((measure) =>
+      buildCardMeasureAggregation(measure, asset.semantic!.measures, asset.columns ?? [])
+    )
+  };
+  appendSemanticFilters(stage, semantic.filters, dimensions);
+  if (breakouts.length) {
+    stage.breakout = breakouts.map((breakout) => buildBreakout(breakout, dimensions));
+  }
+  return {
+    "lib/type": "mbql/query",
+    database,
+    stages: [stage]
+  };
+}
+
+function resolveCardDefaultBreakouts(
+  measures: CardSemanticMeasure[],
+  cardDefault: TimeDimensionMetadata | undefined
+): SemanticBreakout[] {
+  const candidates = measures.map((measure) => measure.timeDimension ?? cardDefault).filter(Boolean);
+  if (!candidates.length) return [];
+  const identities = new Set(candidates.map((candidate) =>
+    `${normalizeFieldName(candidate!.field)}:${candidate!.defaultUnit ?? ""}`
+  ));
+  if (identities.size > 1) {
+    throw new Error("semantic_measure_time_dimension_conflict: Selected measures use different default time dimensions; provide an explicit compatible breakout or query them separately.");
+  }
+  const selected = candidates[0]!;
+  if (selected.defaultUnit && selected.supportedUnits && !selected.supportedUnits.includes(selected.defaultUnit)) {
+    throw new Error(`semantic_default_time_unit_invalid: ${selected.defaultUnit} is not supported by ${selected.field}.`);
+  }
+  return [{ field: selected.field, unit: selected.defaultUnit }];
+}
+
+function validateCardCumulative(
+  cumulative: SemanticCumulative[] | undefined,
+  selectedMeasures: CardSemanticMeasure[],
+  breakoutFields: string[],
+  allMeasures: CardSemanticMeasure[]
+): void {
+  if (!cumulative?.length) return;
+  const selected = new Set(selectedMeasures.map((measure) => normalizeFieldName(measure.name)));
+  const breakouts = new Set(breakoutFields.map(normalizeFieldName));
+  for (const item of cumulative) {
+    const measure = requireCardMeasure(item.measure, allMeasures);
+    if (!selected.has(normalizeFieldName(measure.name))) {
+      throw new Error(`semantic_cumulative_measure_not_selected: ${item.measure} must also appear in semantic.measures.`);
+    }
+    if (!measure.cumulative?.supported || measure.cumulative.strategy !== "running_sum") {
+      throw new Error(
+        `semantic_cumulative_not_supported: ${measure.name}.`
+        + (measure.cumulative?.reason ? ` ${measure.cumulative.reason}` : "")
+      );
+    }
+    if (measure.rollup.strategy !== "sum") {
+      throw new Error(`semantic_cumulative_invalid_rollup: ${measure.name} must use sum rollup for running_sum.`);
+    }
+    if (!breakouts.has(normalizeFieldName(item.orderBy))) {
+      throw new Error(`semantic_cumulative_order_missing: ${item.orderBy} must be included in breakouts.`);
+    }
+    const missingPartition = item.partitionBy?.find((field) => !breakouts.has(normalizeFieldName(field)));
+    if (missingPartition) {
+      throw new Error(`semantic_cumulative_partition_missing: ${missingPartition} must be included in breakouts.`);
+    }
+  }
+}
+
+export function applyCardCumulative(
+  result: NormalizedResult,
+  cumulative: SemanticCumulative[],
+  asset: DataAsset
+): NormalizedResult {
+  if (result.truncated) {
+    throw new Error("semantic_cumulative_incomplete: Result exceeds the row limit; narrow filters or increase the allowed limit before calculating a cumulative value.");
+  }
+  const rows = [...result.rows];
+  const resolved = cumulative.map((item) => {
+    const measure = requireCardMeasure(item.measure, asset.semantic?.measures ?? []);
+    return {
+      item,
+      measureKey: resolveResultColumn(measure.name, result.columns),
+      orderKey: resolveResultColumn(item.orderBy, result.columns),
+      partitionKeys: (item.partitionBy ?? []).map((field) => resolveResultColumn(field, result.columns)),
+      alias: item.alias ?? `${measure.name}_cumulative`
+    };
+  });
+  const sortKeys = Array.from(new Set(resolved.flatMap((item) => [...item.partitionKeys, item.orderKey])));
+  rows.sort((left, right) => {
+    for (const key of sortKeys) {
+      const compared = compareSemanticValues(left[key], right[key]);
+      if (compared !== 0) return compared;
+    }
+    return 0;
+  });
+  for (const definition of resolved) {
+    const totals = new Map<string, number>();
+    for (const row of rows) {
+      const partition = JSON.stringify(definition.partitionKeys.map((key) => row[key] ?? null));
+      const value = row[definition.measureKey];
+      if (typeof value !== "number" || !Number.isFinite(value)) {
+        throw new Error(`semantic_cumulative_non_numeric: ${definition.measureKey} returned a non-numeric value.`);
+      }
+      const total = (totals.get(partition) ?? 0) + value;
+      totals.set(partition, total);
+      row[definition.alias] = total;
+    }
+  }
+  return {
+    ...result,
+    columns: [
+      ...result.columns,
+      ...resolved.map((item) => ({
+        name: item.alias,
+        displayName: item.alias,
+        type: "type/Float",
+        description: `Running sum of ${item.measureKey}`
+      }))
+    ],
+    rows
+  };
+}
+
+function resolveResultColumn(requested: string, columns: ColumnMeta[]): string {
+  const normalized = normalizeFieldName(requested);
+  const column = columns.find((candidate) =>
+    normalizeFieldName(candidate.name) === normalized || normalizeFieldName(candidate.displayName) === normalized
+  );
+  if (!column) throw new Error(`semantic_result_column_missing: ${requested}.`);
+  return column.name;
+}
+
+function compareSemanticValues(left: unknown, right: unknown): number {
+  if (left === right) return 0;
+  if (left === null || left === undefined) return -1;
+  if (right === null || right === undefined) return 1;
+  if (typeof left === "number" && typeof right === "number") return left - right;
+  const leftTime = typeof left === "string" ? Date.parse(left) : Number.NaN;
+  const rightTime = typeof right === "string" ? Date.parse(right) : Number.NaN;
+  if (Number.isFinite(leftTime) && Number.isFinite(rightTime)) return leftTime - rightTime;
+  return String(left).localeCompare(String(right));
+}
+
+function readAssetDatabaseId(asset: DataAsset): number {
+  const sourceDatabase = asset.sourceRefs
+    ?.find((source) => source.system === "metabase" && source.database)
+    ?.database;
+  if (sourceDatabase && Number.isInteger(Number(sourceDatabase))) return Number(sourceDatabase);
+  try {
+    const storedQuery = readStoredDatasetQuery(asset);
+    const database = getNumber(storedQuery.database);
+    if (database !== undefined) return database;
+  } catch {
+    // Native SQL Cards intentionally store readable SQL in queryText. Their
+    // synchronized sourceRefs carry the database id instead.
+  }
+  throw new Error("semantic_card_database_missing: Card has no synchronized Metabase database id. Run npm run sync:metabase.");
+}
+
+function resolveCardMeasures(requested: string[] | undefined, measures: CardSemanticMeasure[]): CardSemanticMeasure[] {
+  if (requested === undefined) {
+    throw new Error("semantic_card_measures_required: metric_set Card queries must select at least one governed measure.");
+  }
+  if (!requested.length) throw new Error("semantic_query_empty_measures: measures must contain at least one measure when provided.");
+  return requested.map((name) => {
+    const normalized = normalizeFieldName(name);
+    const matches = measures.filter((measure) =>
+      [measure.name, measure.label, ...(measure.synonyms ?? [])]
+        .some((candidate) => normalizeFieldName(candidate) === normalized)
+    );
+    if (!matches.length) {
+      throw new Error(`semantic_measure_not_found: ${name}. Available measures: ${measures.map((measure) => measure.name).join(", ")}`);
+    }
+    if (matches.length > 1) throw new Error(`semantic_measure_ambiguous: ${name}. Use the exact measure name.`);
+    return matches[0];
+  });
+}
+
+function validateCardTimeBreakouts(
+  breakouts: SemanticBreakout[],
+  measures: CardSemanticMeasure[],
+  semantic: NonNullable<DataAsset["semantic"]>
+): void {
+  for (const breakout of breakouts) {
+    if (!breakout.unit) continue;
+    const dimension = semantic.dimensions.find((candidate) =>
+      normalizeFieldName(candidate.field) === normalizeFieldName(breakout.field)
+    );
+    if (dimension?.supportedUnits && !dimension.supportedUnits.includes(breakout.unit)) {
+      throw new Error(`semantic_breakout_unit_not_allowed: ${breakout.field} does not support ${breakout.unit}.`);
+    }
+    const applicableTimeDimensions = [
+      semantic.defaultTimeDimension,
+      ...measures.map((measure) => measure.timeDimension)
+    ].filter((candidate) =>
+      candidate && normalizeFieldName(candidate.field) === normalizeFieldName(breakout.field)
+    );
+    for (const timeDimension of applicableTimeDimensions) {
+      if (timeDimension?.supportedUnits && !timeDimension.supportedUnits.includes(breakout.unit)) {
+        throw new Error(`semantic_breakout_unit_not_allowed: ${breakout.field} does not support ${breakout.unit}.`);
+      }
+    }
+  }
+}
+
+function validateCardMeasureRollups(
+  measures: CardSemanticMeasure[],
+  breakouts: SemanticBreakout[],
+  breakoutFields: string[],
+  baseGrain: string[]
+): void {
+  const normalizedBreakouts = new Set(breakoutFields.map(normalizeFieldName));
+  const normalizedBaseGrain = new Set(baseGrain.map(normalizeFieldName));
+  const exactBaseGrain = normalizedBreakouts.size === normalizedBaseGrain.size
+    && Array.from(normalizedBaseGrain).every((field) => normalizedBreakouts.has(field))
+    && breakouts.every((breakout) => !breakout.unit || breakout.unit === "day");
+  for (const measure of measures) {
+    const rollup = measure.rollup;
+    if (rollup.allowedGroupBy) {
+      const allowed = new Set(rollup.allowedGroupBy.map(normalizeFieldName));
+      const invalid = breakoutFields.find((field) => !allowed.has(normalizeFieldName(field)));
+      if (invalid) throw new Error(`semantic_measure_group_by_not_allowed: ${measure.name} cannot group by ${invalid}.`);
+    }
+    if (rollup.allowedTimeUnits) {
+      const invalid = breakouts.find((breakout) => breakout.unit && !rollup.allowedTimeUnits!.includes(breakout.unit));
+      if (invalid) throw new Error(`semantic_measure_time_unit_not_allowed: ${measure.name} does not support ${invalid.unit}.`);
+    }
+    if (rollup.strategy === "forbidden" && !exactBaseGrain) {
+      throw new Error(
+        `semantic_measure_rollup_forbidden: ${measure.name} cannot be rolled up from base grain (${baseGrain.join(", ")}).`
+        + (rollup.reason ? ` ${rollup.reason}` : "")
+      );
+    }
+  }
+}
+
+function buildCardMeasureAggregation(
+  measure: CardSemanticMeasure,
+  allMeasures: CardSemanticMeasure[],
+  columns: ColumnMeta[]
+): unknown {
+  const options = { "lib/uuid": randomUUID(), name: measure.name };
+  if (measure.rollup.strategy === "recompute") {
+    const formula = measure.rollup.formula;
+    if (!formula) throw new Error(`semantic_measure_formula_missing: ${measure.name}.`);
+    const numerator = requireCardMeasure(formula.numerator, allMeasures);
+    const denominator = requireCardMeasure(formula.denominator, allMeasures);
+    return [
+      "/",
+      options,
+      buildCardBaseAggregation(numerator, columns),
+      buildCardBaseAggregation(denominator, columns)
+    ];
+  }
+  const operator = measure.rollup.strategy === "forbidden" ? "max" : measure.rollup.strategy;
+  return [
+    operator,
+    options,
+    buildFieldRef(resolveDimension(measure.sourceColumn ?? measure.name, columns))
+  ];
+}
+
+function buildCardBaseAggregation(measure: CardSemanticMeasure, columns: ColumnMeta[]): unknown {
+  if (!["sum", "min", "max"].includes(measure.rollup.strategy)) {
+    throw new Error(`semantic_measure_formula_dependency_invalid: ${measure.name} must use sum, min, or max rollup.`);
+  }
+  return [
+    measure.rollup.strategy,
+    { "lib/uuid": randomUUID() },
+    buildFieldRef(resolveDimension(measure.sourceColumn ?? measure.name, columns))
+  ];
+}
+
+function requireCardMeasure(name: string, measures: CardSemanticMeasure[]): CardSemanticMeasure {
+  const normalized = normalizeFieldName(name);
+  const measure = measures.find((candidate) => normalizeFieldName(candidate.name) === normalized);
+  if (!measure) throw new Error(`semantic_measure_formula_dependency_missing: ${name}.`);
+  return measure;
 }
 
 function readStoredDatasetQuery(asset: DataAsset): Record<string, unknown> {
@@ -351,8 +720,11 @@ function validateSemanticQueryShape(semantic: SemanticQuery): void {
   if ((semantic.breakouts?.length ?? 0) > 5) throw new Error("semantic_query_too_many_breakouts: maximum 5.");
   if ((semantic.fields?.length ?? 0) > 50) throw new Error("semantic_query_too_many_fields: maximum 50.");
   if ((semantic.aggregations?.length ?? 0) > 10) throw new Error("semantic_query_too_many_aggregations: maximum 10.");
+  if ((semantic.measures?.length ?? 0) > 20) throw new Error("semantic_query_too_many_measures: maximum 20.");
+  if ((semantic.cumulative?.length ?? 0) > 10) throw new Error("semantic_query_too_many_cumulative: maximum 10.");
   if (semantic.fields !== undefined && semantic.fields.length === 0) throw new Error("semantic_query_empty_fields: fields must contain at least one field when provided.");
   if (semantic.aggregations !== undefined && semantic.aggregations.length === 0) throw new Error("semantic_query_empty_aggregations: aggregations must contain at least one aggregation when provided.");
+  if (semantic.measures !== undefined && semantic.measures.length === 0) throw new Error("semantic_query_empty_measures: measures must contain at least one measure when provided.");
 }
 
 function appendSemanticFilters(

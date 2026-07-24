@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { searchCatalogAssets } from "./catalog.js";
+import { findPublishedDashboardParents, searchCatalogAssets, summarizeCatalogAssets } from "./catalog.js";
 import type { DataAsset } from "./types.js";
 
 const assets: DataAsset[] = [
@@ -36,6 +36,30 @@ const assets: DataAsset[] = [
     title: "财务收入日报",
     tags: ["收入"],
     url: "https://metabase.example/question/999"
+  },
+  {
+    id: "metabase:card:1001",
+    platform: "metabase",
+    type: "card",
+    title: "支付核心指标日报",
+    tags: ["支付"],
+    url: "https://metabase.example/question/1001",
+    semantic: {
+      role: "metric_set",
+      baseGrain: ["stat_date", "region"],
+      defaultTimeDimension: { field: "stat_date", defaultUnit: "day", dateMeaning: "支付成功日期" },
+      dimensions: [
+        { field: "stat_date", label: "统计日期" },
+        { field: "region", label: "地区" }
+      ],
+      measures: [{
+        name: "paid_users",
+        label: "支付用户数",
+        description: "支付成功的去重用户数",
+        synonyms: ["付费用户数"],
+        rollup: { strategy: "forbidden" }
+      }]
+    }
   }
 ];
 
@@ -51,4 +75,33 @@ test("matches a Chinese natural-language question and prioritizes Metric", () =>
 test("retains exact short keyword search", () => {
   const result = searchCatalogAssets(assets, { query: "收入" }, 10);
   assert.deepEqual(result.map((asset) => asset.id), ["metabase:card:999"]);
+});
+
+test("searches metric_set Card measure labels, descriptions, and synonyms", () => {
+  const result = searchCatalogAssets(assets, { query: "付费用户数" }, 10);
+  assert.equal(result[0]?.id, "metabase:card:1001");
+});
+
+test("summarizes only the assets passed by the caller", () => {
+  const summary = summarizeCatalogAssets(assets.slice(0, 2));
+  assert.deepEqual(summary, {
+    assetCount: 2,
+    byPlatform: { metabase: 2 },
+    byType: { metric: 1, card: 1 }
+  });
+});
+
+test("finds unpublished Cards only through their published parent Dashboard", () => {
+  const dashboard: DataAsset = {
+    id: "metabase:dashboard:88",
+    platform: "metabase",
+    type: "dashboard",
+    title: "经营看板",
+    tags: [],
+    url: "https://metabase.example/dashboard/88",
+    children: ["metabase:card:473"]
+  };
+  const parents = findPublishedDashboardParents([...assets, dashboard], "metabase:card:473");
+  assert.deepEqual(parents.map((asset) => asset.id), ["metabase:dashboard:88"]);
+  assert.deepEqual(findPublishedDashboardParents([...assets, dashboard], "metabase:card:999"), []);
 });

@@ -7,6 +7,7 @@ export type RequestContext = {
   metabaseSession?: string;
   authMethod?: "mcp-token" | "none";
   aiClient?: string;
+  aiClientVersion?: string;
   clientIp?: string;
   userAgent?: string;
 };

@@ -1,7 +1,17 @@
 import fs from "node:fs";
 import { Pool } from "pg";
+import { validateCardSemanticAgainstAsset } from "./cardSemantic.js";
+import { validateModelSemanticAgainstAsset } from "./modelSemantic.js";
 import { getAuditConfig, getMetadataConfig } from "./config.js";
-import type { AssetCatalog, DataAsset, DataAssetType, DataPlatform } from "./types.js";
+import { resolveAuditAiClient, resolveAuditAiClientVersion } from "./aiClient.js";
+import type {
+  AssetCatalog,
+  CardSemanticMetadata,
+  DataAsset,
+  DataAssetType,
+  DataPlatform,
+  ModelSemanticMetadata
+} from "./types.js";
 
 export type ManagedAsset = {
   asset: DataAsset;
@@ -18,6 +28,15 @@ export type ManagedAssetPatch = {
   description?: string | null;
   businessDomain?: string | null;
   tags?: string[];
+  semantic?: CardSemanticMetadata | null;
+  modelSemantic?: ModelSemanticMetadata | null;
+};
+
+export type ManagedAssetDomainSummary = {
+  name: string;
+  assetCount: number;
+  publishedCount: number;
+  status: "open" | "partial" | "closed";
 };
 
 export type ManagedAssetSort =
@@ -44,7 +63,9 @@ export type AuditLogRow = {
   userEmail?: string;
   authMethod?: string;
   aiClient?: string;
+  clientVersion?: string;
   toolName: string;
+  dataQuestion?: string;
   assetId?: string;
   assetPlatform?: string;
   status: string;
@@ -77,6 +98,23 @@ export async function readPublishedCatalog(): Promise<AssetCatalog> {
     updatedAt: latest === undefined ? undefined : new Date(latest).toISOString(),
     assets: result.rows.map((row) => mergeAssetOverrides(row.metadata, row.admin_overrides))
   };
+}
+
+export async function readActiveAsset(assetId: string): Promise<DataAsset | undefined> {
+  const client = await getMetadataPool();
+  await ensureMetadataTable(client);
+  const config = getMetadataConfig();
+  const result = await client.query<{
+    metadata: DataAsset;
+    admin_overrides: Record<string, unknown>;
+  }>(
+    `select metadata, admin_overrides
+     from ${qualifiedName(config.schema, config.table)}
+     where asset_id = $1 and is_active = true`,
+    [assetId]
+  );
+  const row = result.rows[0];
+  return row ? mergeAssetOverrides(row.metadata, row.admin_overrides) : undefined;
 }
 
 export async function upsertPlatformAssets(platform: DataPlatform, assets: DataAsset[]): Promise<{
@@ -148,7 +186,7 @@ export async function upsertPlatformAssets(platform: DataPlatform, assets: DataA
 export async function listManagedAssets(input: {
   platform?: DataPlatform;
   assetType?: DataAssetType;
-  businessDomain?: string;
+  businessDomains?: string[];
   query?: string;
   published?: boolean;
   limit?: number;
@@ -170,9 +208,10 @@ export async function listManagedAssets(input: {
     values.push(input.assetType);
     conditions.push(`asset_type = $${values.length}`);
   }
-  if (input.businessDomain?.trim()) {
-    values.push(input.businessDomain.trim());
-    conditions.push(`coalesce(admin_overrides->>'businessDomain', metadata->>'businessDomain') = $${values.length}`);
+  const businessDomains = Array.from(new Set((input.businessDomains ?? []).map((value) => value.trim()).filter(Boolean)));
+  if (businessDomains.length) {
+    values.push(businessDomains);
+    conditions.push(`coalesce(admin_overrides->>'businessDomain', metadata->>'businessDomain') = any($${values.length}::text[])`);
   }
   if (input.published !== undefined) {
     values.push(input.published);
@@ -235,6 +274,41 @@ export async function listManagedAssetDomains(platform?: DataPlatform): Promise<
   return result.rows.map((row) => row.business_domain).filter(Boolean);
 }
 
+export async function listManagedAssetDomainSummaries(platform?: DataPlatform): Promise<ManagedAssetDomainSummary[]> {
+  const client = await getMetadataPool();
+  await ensureMetadataTable(client);
+  const config = getMetadataConfig();
+  const tableName = qualifiedName(config.schema, config.table);
+  const values: unknown[] = [];
+  const platformCondition = platform ? "and platform = $1" : "";
+  if (platform) values.push(platform);
+  const result = await client.query<{
+    business_domain: string;
+    asset_count: string;
+    published_count: string;
+  }>(
+    `select coalesce(admin_overrides->>'businessDomain', metadata->>'businessDomain') as business_domain,
+            count(*)::text as asset_count,
+            count(*) filter (where is_published = true)::text as published_count
+     from ${tableName}
+     where is_active = true ${platformCondition}
+       and nullif(trim(coalesce(admin_overrides->>'businessDomain', metadata->>'businessDomain')), '') is not null
+     group by business_domain
+     order by business_domain asc`,
+    values
+  );
+  return result.rows.map((row) => {
+    const assetCount = Number.parseInt(row.asset_count, 10);
+    const publishedCount = Number.parseInt(row.published_count, 10);
+    return {
+      name: row.business_domain,
+      assetCount,
+      publishedCount,
+      status: publishedCount === 0 ? "closed" : publishedCount === assetCount ? "open" : "partial"
+    };
+  });
+}
+
 export async function listManagedAssetTypes(platform?: DataPlatform): Promise<DataAssetType[]> {
   const client = await getMetadataPool();
   await ensureMetadataTable(client);
@@ -266,6 +340,28 @@ export async function bulkUpdateManagedAssets(assetIds: string[], published: boo
   return result.rowCount ?? 0;
 }
 
+export async function bulkUpdateManagedAssetDomains(
+  platform: DataPlatform,
+  businessDomains: string[],
+  published: boolean
+): Promise<number> {
+  const client = await getMetadataPool();
+  await ensureMetadataTable(client);
+  const config = getMetadataConfig();
+  const tableName = qualifiedName(config.schema, config.table);
+  const uniqueDomains = Array.from(new Set(businessDomains.map((value) => value.trim()).filter(Boolean))).slice(0, 100);
+  if (!uniqueDomains.length) return 0;
+  const result = await client.query(
+    `update ${tableName}
+     set is_published = $3, updated_at = now()
+     where platform = $1
+       and is_active = true
+       and coalesce(admin_overrides->>'businessDomain', metadata->>'businessDomain') = any($2::text[])`,
+    [platform, uniqueDomains, published]
+  );
+  return result.rowCount ?? 0;
+}
+
 export async function updateManagedAsset(assetId: string, patch: ManagedAssetPatch): Promise<ManagedAsset | undefined> {
   const client = await getMetadataPool();
   await ensureMetadataTable(client);
@@ -282,6 +378,11 @@ export async function updateManagedAsset(assetId: string, patch: ManagedAssetPat
   if (patch.description !== undefined) overrides.description = patch.description;
   if (patch.businessDomain !== undefined) overrides.businessDomain = patch.businessDomain;
   if (patch.tags !== undefined) overrides.tags = patch.tags;
+  if (patch.semantic !== undefined) overrides.semantic = patch.semantic;
+  if (patch.modelSemantic !== undefined) overrides.modelSemantic = patch.modelSemantic;
+  const mergedAsset = mergeAssetOverrides(asset, overrides);
+  validateCardSemanticAgainstAsset(mergedAsset);
+  validateModelSemanticAgainstAsset(mergedAsset);
   const published = patch.published;
   const result = await client.query<{
     metadata: DataAsset;
@@ -345,7 +446,10 @@ export async function listAuditLogs(input: AuditLogFilters): Promise<{ logs: Aud
     user_email?: string;
     auth_method?: string;
     ai_client?: string;
+    ai_client_version?: string;
+    user_agent?: string;
     tool_name: string;
+    data_question?: string;
     asset_id?: string;
     asset_platform?: string;
     status: string;
@@ -355,31 +459,46 @@ export async function listAuditLogs(input: AuditLogFilters): Promise<{ logs: Aud
     error_code?: string;
     error_message?: string;
   }>(
-    `select id::text, created_at, user_email, auth_method, ai_client, tool_name, asset_id,
+    `select id::text, created_at, user_email, auth_method, ai_client,
+            to_jsonb(audit_log)->>'ai_client_version' as ai_client_version,
+            user_agent, tool_name,
+            coalesce(
+              question_text,
+              case
+                when tool_name = 'query_starrocks' then metadata->>'question'
+                else query_text
+              end
+            ) as data_question,
+            asset_id,
             asset_platform, status, row_count, duration_ms, client_ip, error_code, error_message
-     from ${tableName} ${where}
+     from ${tableName} audit_log ${where}
      order by created_at desc
      limit $${values.length - 1} offset $${values.length}`,
     values
   );
   return {
     total: Number.parseInt(countResult.rows[0]?.count ?? "0", 10),
-    logs: result.rows.map((row) => ({
-      id: row.id,
-      createdAt: row.created_at.toISOString(),
-      userEmail: row.user_email,
-      authMethod: row.auth_method,
-      aiClient: row.ai_client,
-      toolName: row.tool_name,
-      assetId: row.asset_id,
-      assetPlatform: row.asset_platform,
-      status: row.status,
-      rowCount: row.row_count,
-      durationMs: row.duration_ms,
-      clientIp: row.client_ip,
-      errorCode: row.error_code,
-      errorMessage: row.error_message
-    }))
+    logs: result.rows.map((row) => {
+      const aiClient = resolveAuditAiClient(row.ai_client, row.user_agent);
+      return {
+        id: row.id,
+        createdAt: row.created_at.toISOString(),
+        userEmail: row.user_email,
+        authMethod: row.auth_method,
+        aiClient,
+        clientVersion: resolveAuditAiClientVersion(row.ai_client_version, row.user_agent, aiClient),
+        toolName: row.tool_name,
+        dataQuestion: row.data_question,
+        assetId: row.asset_id,
+        assetPlatform: row.asset_platform,
+        status: row.status,
+        rowCount: row.row_count,
+        durationMs: row.duration_ms,
+        clientIp: row.client_ip,
+        errorCode: row.error_code,
+        errorMessage: row.error_message
+      };
+    })
   };
 }
 
@@ -475,6 +594,8 @@ function mergeAssetOverrides(asset: DataAsset, overrides: Record<string, unknown
   const merged = { ...asset, ...(overrides ?? {}) } as DataAsset & Record<string, unknown>;
   if (merged.description === null) delete merged.description;
   if (merged.businessDomain === null) delete merged.businessDomain;
+  if (merged.semantic === null) delete merged.semantic;
+  if (merged.modelSemantic === null) delete merged.modelSemantic;
   return merged;
 }
 

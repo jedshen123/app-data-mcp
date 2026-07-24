@@ -11,12 +11,12 @@ import { auditToolCall, type AuditDetails } from "./audit.js";
 import {
   buildAssetSelectionSummary,
   evaluateModelAggregationSelection,
-  orderAssetsByGovernancePriority,
+  rankAssetsForQuestion,
   summarizeSelectionRank
 } from "./assetSelectionGovernance.js";
 import { getMetabaseLoginUrl } from "./auth/loginRoutes.js";
 import { getStoredMetabaseSessionStatus } from "./auth/metabaseSessions.js";
-import { CatalogStore } from "./catalog.js";
+import { CatalogStore, type ResolvedAsset, summarizeCatalogAssets } from "./catalog.js";
 import {
   ACCESS_MODE,
   getAudienceExportConfig,
@@ -34,17 +34,25 @@ import { createAudienceExport } from "./audienceExports.js";
 import { runLiveAsset } from "./connectors/runAsset.js";
 import { runMetabaseAudience, runMetabaseAudienceCsv } from "./connectors/metabase.js";
 import { runStarRocksQuery } from "./connectors/starrocks.js";
-import { assetNotFound, summarizeAsset, toLimitedTextPayload, toTextPayload } from "./format.js";
+import { assetNotFound, summarizeAsset, summarizeSemanticMatches, toLimitedTextPayload, toTextPayload } from "./format.js";
 import { getRequestContext } from "./requestContext.js";
 import { evaluateSqlGovernance } from "./queryGovernance.js";
-import { buildEffectiveInstructions, getGlobalInstructions, isManagedToolEnabled, listManagedTools } from "./toolStore.js";
+import {
+  buildEffectiveInstructions,
+  getAvailableToolNames,
+  getGlobalInstructions,
+  listManagedTools
+} from "./toolStore.js";
 
-export async function createAppDataMcpServer() {
+export async function createAppDataMcpServer(options: { user?: string } = {}) {
   const catalog = CatalogStore.fromEnv();
   const limits = getDataLimitConfig();
-  const [managedTools, globalInstructions] = await Promise.all([listManagedTools(), getGlobalInstructions()]);
-  const enabledTools = new Set(managedTools.filter((tool) => tool.enabled).map((tool) => tool.name));
-  const effectiveInstructions = buildEffectiveInstructions(globalInstructions, managedTools);
+  const [managedTools, globalInstructions, enabledTools] = await Promise.all([
+    listManagedTools(),
+    getGlobalInstructions(),
+    getAvailableToolNames(options.user)
+  ]);
+  const effectiveInstructions = buildEffectiveInstructions(globalInstructions, managedTools, enabledTools);
 
   const server = new McpServer({
     name: "app-data-mcp",
@@ -55,7 +63,7 @@ export async function createAppDataMcpServer() {
 
   if (enabledTools.has("search_assets")) server.tool(
     "search_assets",
-    "MANDATORY FIRST STEP for ordinary data questions. Search published governed assets using the user's original question. Selection order is Metric > Model > Card > Dashboard: inspect matching Metrics before using a Model to recompute an aggregation.",
+    "MANDATORY FIRST STEP for ordinary data questions. Search published governed assets using the user's original question. Cards rank ahead of Models for metric, trend, and breakdown analysis.",
     {
       query: z.string().default("").describe("Keyword query, e.g. 新增用户, activation, retention."),
       platform: z.enum(["metabase", "posthog", "local"]).optional(),
@@ -66,6 +74,7 @@ export async function createAppDataMcpServer() {
     async (input) => {
       return auditToolCall("search_assets", {
         query: input.query,
+        question: input.query,
         limit: input.limit,
         metadata: {
           platform: input.platform,
@@ -82,23 +91,36 @@ export async function createAppDataMcpServer() {
           await catalog.search({ ...input, limit: limits.maxSearchLimit }),
           requestContext.user
         );
-        const assets = orderAssetsByGovernancePriority(
-          await filterAssetsByLiveAccess(snapshotVisibleAssets)
-        ).slice(0, requestedLimit);
-        const selection = buildAssetSelectionSummary(assets);
+        const routing = rankAssetsForQuestion(
+          await filterAssetsByLiveAccess(snapshotVisibleAssets),
+          input.query
+        );
+        const assets = routing.assets.slice(0, requestedLimit);
+        const selection = buildAssetSelectionSummary(assets, routing.intent);
         return toTextPayload({
           assets: assets.map((asset, index) => ({
             ...summarizeAsset(asset),
-            selection: summarizeSelectionRank(asset, index + 1, selection.recommendedAssetId)
+            matchedSemanticItems: summarizeSemanticMatches(asset, input.query),
+            selection: summarizeSelectionRank(
+              asset,
+              index + 1,
+              selection.recommendedAssetId,
+              routing.assessments.get(asset.id)
+            )
           })),
           count: assets.length,
           selection,
           note: "Results come from published PostgreSQL metadata and are filtered by synchronized snapshots plus the current user's live Metabase permissions. Use get_asset, trace_asset, or run_asset with an id for details.",
           nextSteps: [
-            "Inspect matching Metric candidates with get_asset before selecting a Model. For Metabase Metrics, preserve metric.formula and use semantic.filters/breakouts.",
-            "Do not use Model aggregations to recreate a Metric. Model aggregation fallback requires the original question plus rejected_asset_ids and a concrete fallback_reason.",
+            "Follow selection.candidateOrder, but call get_asset before execution to verify the recommended asset's dimensions, parameters, formula, and field semantics.",
+            "Prefer execution.mode=precomputed/cached metric-set Cards, then governed Metrics, then live-query Cards. Always call get_asset before execution.",
+            "Do not use Model aggregations to recreate a result already available from a Metric or Card. Model defaults to detail-only; guarded aggregation requires declared fields, the original question, rejected_asset_ids, and a concrete fallback_reason.",
+            "Treat semantic.role=metric_set Cards as governed multi-measure assets: inspect measures, formula, execution, defaultTimeDimension, dimensions, and rollup rules, then use semantic.measures/filters/breakouts.",
+            "Treat an ordinary Card as a direct answer mainly for saved-report intent or when its parameters and output columns clearly cover the question.",
             "For Metabase dashboards, inspect parameters and dashboardParameterMappings to decide whether filters can answer the user's question.",
-            "Do not call query_starrocks while a suitable candidate exists. SQL fallback requires rejecting returned candidate IDs with a concrete reason."
+            ...(enabledTools.has("query_starrocks")
+              ? ["Do not call query_starrocks while a suitable candidate exists. SQL fallback requires rejecting returned candidate IDs with a concrete reason."]
+              : [])
           ]
         });
       });
@@ -107,7 +129,7 @@ export async function createAppDataMcpServer() {
 
   if (enabledTools.has("get_asset")) server.tool(
     "get_asset",
-    "Get full metadata for one data asset, including source URL, query text, columns, children, and warnings.",
+    "Get full metadata for one published data asset, or for an unpublished Metabase Card inherited from an accessible published Dashboard. Includes source URL, query text, columns, children, and warnings.",
     {
       asset_id: z
         .string()
@@ -119,13 +141,17 @@ export async function createAppDataMcpServer() {
         const authError = requireUserToken();
         if (authError) return authError;
 
-        const asset = await catalog.findById(asset_id);
-        if (!asset) return assetNotFound(asset_id);
+        const resolved = await catalog.resolveById(asset_id);
+        if (!resolved) return assetNotFound(asset_id);
+        const { asset } = resolved;
         auditDetails.assetPlatform = asset.platform;
         auditDetails.assetType = asset.type;
-        const accessError = await requireMetadataAccess(asset);
+        const accessError = await requireResolvedAssetAccess(resolved);
         if (accessError) return accessError;
-        return toTextPayload({ asset });
+        return toTextPayload({
+          asset,
+          access: describeResolvedAssetAccess(resolved)
+        });
       });
     }
   );
@@ -142,11 +168,12 @@ export async function createAppDataMcpServer() {
         const authError = requireUserToken();
         if (authError) return authError;
 
-        const asset = await catalog.findById(asset_id);
-        if (!asset) return assetNotFound(asset_id);
+        const resolved = await catalog.resolveById(asset_id);
+        if (!resolved) return assetNotFound(asset_id);
+        const { asset } = resolved;
         auditDetails.assetPlatform = asset.platform;
         auditDetails.assetType = asset.type;
-        const accessError = await requireMetadataAccess(asset);
+        const accessError = await requireResolvedAssetAccess(resolved);
         if (accessError) return accessError;
 
         const referencedAssets = await Promise.all(
@@ -167,6 +194,7 @@ export async function createAppDataMcpServer() {
             getRequestContext().user
           ).map(summarizeAsset),
           originalUrl: asset.url,
+          access: describeResolvedAssetAccess(resolved),
           warnings: asset.warnings ?? []
         });
       });
@@ -175,17 +203,17 @@ export async function createAppDataMcpServer() {
 
   if (enabledTools.has("run_asset")) server.tool(
     "run_asset",
-    "Return read-only live data for a supported Metabase/PostHog asset. Metric is preferred over Model for governed aggregations. Model aggregations require question and are blocked while a matching Metric remains unrejected.",
+    "Return read-only live data for a supported asset. Precomputed/cached metric-set Cards are preferred, followed by Metrics and live Cards. Models default to detail-only; guarded aggregation requires declared fields and fallback evidence.",
     {
       asset_id: z.string(),
       question: z.string().min(1).optional().describe(
-        "The user's original data question. Required when semantic.aggregations is used on a Model so the server can enforce Metric-first selection."
+        "The user's original data question. Required when semantic.aggregations is used on a Model so the server can enforce Metric-and-Card-first selection."
       ),
       rejected_asset_ids: z.array(z.string().min(1)).max(50).optional().describe(
-        "Matching higher-priority Metric IDs already inspected and found unsuitable. Requires fallback_reason."
+        "Matching higher-priority Metric or Card IDs already inspected and found unsuitable. Requires fallback_reason."
       ),
       fallback_reason: z.string().min(1).max(1000).optional().describe(
-        "Concrete reason the rejected Metric candidates cannot answer the question."
+        "Concrete reason the rejected Metric or Card candidates cannot answer the question."
       ),
       params: z
         .record(z.unknown())
@@ -208,9 +236,16 @@ export async function createAppDataMcpServer() {
           operator: z.enum(["count", "distinct", "sum", "avg", "min", "max"]),
           field: z.string().min(1).optional(),
           alias: z.string().min(1).max(100).optional()
+        }).strict()).max(10).optional(),
+        measures: z.array(z.string().min(1)).min(1).max(20).optional(),
+        cumulative: z.array(z.object({
+          measure: z.string().min(1),
+          orderBy: z.string().min(1),
+          partitionBy: z.array(z.string().min(1)).max(10).optional(),
+          alias: z.string().min(1).max(100).optional()
         }).strict()).max(10).optional()
       }).strict().optional().describe(
-        "Validated semantic controls for Metabase Model/Metric only. Metric allows filters/breakouts while preserving its governed formula. Model allows filters/fields, or aggregations with optional breakouts. Use exact names from get_asset columns or metric.dimensions. Pass breakouts:[] to remove a Metric's default grouping."
+        "Validated semantic controls for Metabase Model, Metric, and semantic.role=metric_set Cards. Card metric sets enforce rollup and recompute formulas such as sum(B)/sum(C). Metric preserves its formula. Model always allows governed detail fields, but aggregations require modelSemantic.aggregationPolicy=guarded and declared baseGrain/entityFields/additiveFields."
       ),
       limit: z.number().int().min(1).max(limits.maxResultRowLimit).default(limits.defaultResultRowLimit)
     },
@@ -218,6 +253,7 @@ export async function createAppDataMcpServer() {
       const auditDetails: AuditDetails = {
         assetId: asset_id,
         query: question,
+        question,
         params,
         limit,
         metadata: {
@@ -230,26 +266,20 @@ export async function createAppDataMcpServer() {
         const authError = requireUserToken();
         if (authError) return authError;
 
-        const asset = await catalog.findById(asset_id);
-        if (!asset) return assetNotFound(asset_id);
+        const resolved = await catalog.resolveById(asset_id);
+        if (!resolved) return assetNotFound(asset_id);
+        const { asset } = resolved;
         auditDetails.assetPlatform = asset.platform;
         auditDetails.assetType = asset.type;
-        const snapshotDecision = canReadAssetMetadataFromSnapshot(asset, getRequestContext().user);
-        if (!snapshotDecision.allowed) {
-          return toTextPayload({
-            error: "asset_access_denied",
-            asset_id,
-            reason: snapshotDecision.reason,
-            message: "This asset is hidden by the synchronized metadata access snapshot."
-          });
-        }
-        const metricCandidates = question?.trim()
-          ? filterAssetsBySnapshotAccess(
+        const accessError = await requireResolvedAssetRunAccess(resolved);
+        if (accessError) return accessError;
+        const higherPriorityCandidates = question?.trim()
+          ? (await filterAssetsByLiveAccess(filterAssetsBySnapshotAccess(
               await catalog.search({ query: question, platform: asset.platform, limit: limits.maxSearchLimit }),
               getRequestContext().user
-            ).filter((candidate) => candidate.type === "metric")
+            ))).filter((candidate) => candidate.type === "metric" || candidate.type === "card")
           : [];
-        const selectionDecision = evaluateModelAggregationSelection(asset, metricCandidates, {
+        const selectionDecision = evaluateModelAggregationSelection(asset, higherPriorityCandidates, {
           question,
           rejectedAssetIds: rejected_asset_ids,
           fallbackReason: fallback_reason,
@@ -260,10 +290,10 @@ export async function createAppDataMcpServer() {
             error: selectionDecision.code,
             message: selectionDecision.message,
             attempted_asset: summarizeAsset(asset),
-            metric_candidates: selectionDecision.candidates.map(summarizeAsset),
+            higher_priority_candidates: selectionDecision.candidates.map(summarizeAsset),
             required_action: selectionDecision.code === "asset_question_required"
               ? "Retry run_asset with the user's original question."
-              : "Inspect each Metric with get_asset and run a suitable Metric. To fall back, retry with all unsuitable Metric IDs in rejected_asset_ids and provide fallback_reason."
+              : "Inspect each Metric and Card with get_asset and run a suitable asset. To fall back, retry with all unsuitable candidate IDs in rejected_asset_ids and provide fallback_reason."
           });
         }
         const paramsError = validateAssetParams(asset, params);
@@ -275,6 +305,7 @@ export async function createAppDataMcpServer() {
             const live = await runLiveAsset(asset, { params, semantic, limit });
             return toLimitedTextPayload({
               asset: summarizeAsset(asset),
+              access: describeResolvedAssetAccess(resolved),
               data: live.data,
               params: params ?? {},
               semantic: semantic ?? undefined,
@@ -287,6 +318,7 @@ export async function createAppDataMcpServer() {
             if (asset.platform === "metabase" && isReauthError(error)) {
               return toTextPayload({
                 asset: summarizeAsset(asset),
+                access: describeResolvedAssetAccess(resolved),
                 data: null,
                 params: params ?? {},
                 live: false,
@@ -303,18 +335,20 @@ export async function createAppDataMcpServer() {
             if (errorMessage.startsWith("semantic_")) {
               return toTextPayload({
                 asset: summarizeAsset(asset),
+                access: describeResolvedAssetAccess(resolved),
                 data: null,
                 params: params ?? {},
                 semantic: semantic ?? undefined,
                 live: false,
                 error: "semantic_query_invalid",
                 message: errorMessage,
-                guidance: "Call get_asset and use exact field names from columns (Model) or metric.dimensions (Metric). Metric formulas are immutable; use only filters and breakouts for Metric assets."
+                guidance: "Call get_asset and use exact field or measure names. For metric_set Cards, inspect semantic.measures, dimensions, defaultTimeDimension, and rollup rules. Metric formulas are immutable."
               });
             }
             if (!asset.sampleData) {
               return toTextPayload({
                 asset: summarizeAsset(asset),
+                access: describeResolvedAssetAccess(resolved),
                 data: null,
                 params: params ?? {},
                 live: false,
@@ -341,6 +375,7 @@ export async function createAppDataMcpServer() {
         if (!asset.sampleData) {
           return toTextPayload({
             asset: summarizeAsset(asset),
+            access: describeResolvedAssetAccess(resolved),
             data: null,
             params: params ?? {},
             live: false,
@@ -361,6 +396,7 @@ export async function createAppDataMcpServer() {
 
         return toLimitedTextPayload({
           asset: summarizeAsset(asset),
+          access: describeResolvedAssetAccess(resolved),
           data: {
             columns: asset.sampleData.columns,
             rows,
@@ -586,6 +622,7 @@ export async function createAppDataMcpServer() {
     async ({ question, sql, purpose, rejected_asset_ids, fallback_reason, limit }) => {
       const auditDetails: AuditDetails = {
         query: sql,
+        question,
         limit,
         assetPlatform: "starrocks",
         assetType: "adhoc_sql",
@@ -598,13 +635,6 @@ export async function createAppDataMcpServer() {
         }
       };
       return auditToolCall("query_starrocks", auditDetails, async () => {
-        if (!await isManagedToolEnabled("query_starrocks")) {
-          return toTextPayload({
-            error: "tool_not_enabled",
-            tool: "query_starrocks",
-            message: "SQL 查询工具 query_starrocks 未开放，当前无法通过此 MCP 直接查询 StarRocks 表数据。请联系 MCP 管理员开放该工具，或改用已开放的 Metabase/PostHog 数据资产。"
-          });
-        }
         const authError = requireUserToken();
         if (authError) return authError;
 
@@ -673,9 +703,12 @@ export async function createAppDataMcpServer() {
 
       const requestContext = getRequestContext();
       const assetCatalog = await catalog.getCatalog();
+      const visibleAssets = await filterAssetsByLiveAccess(
+        filterAssetsBySnapshotAccess(assetCatalog.assets, requestContext.user)
+      );
       const domains = Array.from(
         new Set(
-          filterAssetsBySnapshotAccess(assetCatalog.assets, requestContext.user)
+          visibleAssets
             .map((asset) => asset.businessDomain)
             .filter((domain): domain is string => Boolean(domain))
         )
@@ -686,23 +719,45 @@ export async function createAppDataMcpServer() {
 
   if (enabledTools.has("catalog_status")) server.tool(
     "catalog_status",
-    "Show whether the PostgreSQL asset catalog is initialized and how many published assets it contains.",
+    "Show catalog freshness and asset counts visible to the current MCP user. Metabase counts are filtered with the user's live permissions.",
     {},
     async () => {
       return auditToolCall("catalog_status", {}, async () => {
+        const authError = requireUserToken();
+        if (authError) return authError;
+
         const status = await catalog.status();
-        const freshness = status.initialized ? await buildCatalogFreshness(catalog) : undefined;
+        if (!status.initialized) {
+          return toTextPayload({
+            ...status,
+            scope: "current_user",
+            nextSteps: ["Check PostgreSQL DB_* configuration and database permissions."]
+          });
+        }
+
+        const requestContext = getRequestContext();
+        const assetCatalog = await catalog.getCatalog();
+        const snapshotVisibleAssets = filterAssetsBySnapshotAccess(
+          assetCatalog.assets,
+          requestContext.user
+        );
+        const visibleAssets = await filterAssetsByLiveAccess(snapshotVisibleAssets);
+        const visibleSummary = summarizeCatalogAssets(visibleAssets);
+        const freshness = await buildCatalogFreshness(catalog, assetCatalog);
+
         return toTextPayload({
           ...status,
+          ...visibleSummary,
+          scope: "current_user",
+          user: requestContext.user,
           freshness,
-          nextSteps: status.initialized
-            ? status.assetCount > 0
-              ? buildCatalogStatusNextSteps(freshness)
-              : [
-                  "The published catalog is empty.",
-                  "Run a Metabase/PostHog sync, then publish assets from the /admin management page."
-                ]
-            : ["Check PostgreSQL DB_* configuration and database permissions."]
+          note: "Counts include only assets visible to the current MCP user. Metabase assets are filtered by synchronized snapshots and the user's live Metabase permissions.",
+          nextSteps: visibleSummary.assetCount > 0
+            ? buildCatalogStatusNextSteps(freshness)
+            : [
+                "No published assets are visible to the current user.",
+                "Check the user's Metabase permissions or publish suitable assets from the /admin management page."
+              ]
         });
       });
     }
@@ -748,7 +803,9 @@ export async function createAppDataMcpServer() {
 
   if (enabledTools.has("connector_status")) server.tool(
     "connector_status",
-    "Show whether Metabase, PostHog, and StarRocks connector environment variables are configured. Secrets are never returned.",
+    enabledTools.has("query_starrocks")
+      ? "Show whether Metabase, PostHog, and StarRocks connector environment variables are configured. Secrets are never returned."
+      : "Show whether Metabase and PostHog connector environment variables are configured. Secrets are never returned.",
     {},
     async () => {
       return auditToolCall("connector_status", {}, async () => {
@@ -809,30 +866,21 @@ export async function createAppDataMcpServer() {
             projectIdConfigured: Boolean(posthog.projectId),
             personalApiKeyConfigured: Boolean(posthog.personalApiKey)
           },
-          starrocks: {
-            configured: starrocks.configured,
-            toolEnabled: enabledTools.has("query_starrocks"),
-            availability: !enabledTools.has("query_starrocks")
-              ? "tool_disabled"
-              : starrocks.configured
-                ? "available"
-                : "connector_not_configured",
-            hostConfigured: Boolean(starrocks.host),
-            port: starrocks.port,
-            userConfigured: Boolean(starrocks.user),
-            database: starrocks.database,
-            ssl: starrocks.ssl,
-            queryTimeoutMs: starrocks.queryTimeoutMs,
-            missing: starrocks.missing
-          },
-          toolAvailability: {
-            enabled: managedTools.filter((tool) => tool.enabled).map((tool) => tool.name),
-            disabled: managedTools.filter((tool) => !tool.enabled).map((tool) => ({
-              name: tool.name,
-              title: tool.title,
-              reason: "disabled_by_administrator"
-            }))
-          }
+          ...(enabledTools.has("query_starrocks")
+            ? {
+                starrocks: {
+                  configured: starrocks.configured,
+                  availability: starrocks.configured ? "available" : "connector_not_configured",
+                  hostConfigured: Boolean(starrocks.host),
+                  port: starrocks.port,
+                  userConfigured: Boolean(starrocks.user),
+                  database: starrocks.database,
+                  ssl: starrocks.ssl,
+                  queryTimeoutMs: starrocks.queryTimeoutMs,
+                  missing: starrocks.missing
+                }
+              }
+            : {})
         });
       });
     }
@@ -916,6 +964,62 @@ async function requireMetadataAccess(asset: import("./types.js").DataAsset) {
   return null;
 }
 
+async function requireResolvedAssetAccess(resolved: ResolvedAsset) {
+  if (!resolved.inheritedFromDashboards.length) {
+    return requireMetadataAccess(resolved.asset);
+  }
+
+  const requestContext = getRequestContext();
+  const deniedReasons: string[] = [];
+  for (const dashboard of resolved.inheritedFromDashboards) {
+    const snapshotDecision = canReadAssetMetadataFromSnapshot(dashboard, requestContext.user);
+    if (!snapshotDecision.allowed) {
+      deniedReasons.push(`${dashboard.id}:${snapshotDecision.reason ?? "snapshot_denied"}`);
+      continue;
+    }
+    const liveDecision = await canReadAssetMetadataLive(dashboard);
+    if (liveDecision.allowed) return null;
+    deniedReasons.push(`${dashboard.id}:${liveDecision.reason ?? "live_denied"}`);
+  }
+
+  return toTextPayload({
+    error: "metadata_access_denied",
+    asset_id: resolved.asset.id,
+    reason: "no_accessible_published_parent_dashboard",
+    parent_dashboard_checks: deniedReasons,
+    loginUrl: getMetabaseLoginUrl(),
+    message: "This Card is inherited from a published Dashboard, but Metabase did not allow the current user to read any parent Dashboard."
+  });
+}
+
+async function requireResolvedAssetRunAccess(resolved: ResolvedAsset) {
+  if (resolved.inheritedFromDashboards.length) {
+    return requireResolvedAssetAccess(resolved);
+  }
+
+  const snapshotDecision = canReadAssetMetadataFromSnapshot(
+    resolved.asset,
+    getRequestContext().user
+  );
+  if (snapshotDecision.allowed) return null;
+  return toTextPayload({
+    error: "asset_access_denied",
+    asset_id: resolved.asset.id,
+    reason: snapshotDecision.reason,
+    message: "This asset is hidden by the synchronized metadata access snapshot."
+  });
+}
+
+function describeResolvedAssetAccess(resolved: ResolvedAsset) {
+  if (!resolved.inheritedFromDashboards.length) {
+    return { mode: "published" as const };
+  }
+  return {
+    mode: "dashboard_inherited" as const,
+    dashboards: resolved.inheritedFromDashboards.map(summarizeAsset)
+  };
+}
+
 function validateAssetParams(asset: import("./types.js").DataAsset, params: Record<string, unknown> | undefined) {
   if (!params || Array.isArray(params.parameters)) return null;
   if (!asset.parameters?.length) return null;
@@ -939,8 +1043,11 @@ function validateAssetParams(asset: import("./types.js").DataAsset, params: Reco
   });
 }
 
-async function buildCatalogFreshness(catalog: CatalogStore) {
-  const assetCatalog = await catalog.getCatalog();
+async function buildCatalogFreshness(
+  catalog: CatalogStore,
+  loadedCatalog?: Awaited<ReturnType<CatalogStore["getCatalog"]>>
+) {
+  const assetCatalog = loadedCatalog ?? await catalog.getCatalog();
   const syncConfig = getSyncFreshnessConfig();
   const metabaseAssets = assetCatalog.assets.filter((asset) => asset.platform === "metabase");
   const posthogAssets = assetCatalog.assets.filter((asset) => asset.platform === "posthog");

@@ -235,7 +235,8 @@ function readDashboardChildren(detail: Record<string, unknown> | undefined): str
       const card = getObject(dashcard.card);
       const cardId = getNumber(dashcard.card_id) ?? getNumber(card?.id);
       if (cardId === undefined) return [];
-      return [`metabase:${isMetabaseModel(card) ? "model" : "card"}:${cardId}`];
+      const type = isMetabaseModel(card) ? "model" : isMetabaseMetric(card) ? "metric" : "card";
+      return [`metabase:${type}:${cardId}`];
     });
   return children.length ? children : undefined;
 }
@@ -347,6 +348,7 @@ function toCardAsset(
       ...(metricSourceRef ? [metricSourceRef] : []),
       {
         system: "metabase",
+        database: databaseId === undefined ? undefined : String(databaseId),
         url: joinUrl(client.publicUrl, `/${route}/${id}`)
       }
     ],

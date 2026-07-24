@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { getPostHogConfig } from "../config.js";
 import { upsertPlatformAssets } from "../metadataStore.js";
+import { readPostHogAnalysisType } from "../posthogAnalysisType.js";
 import type { AssetParameter, DataAsset } from "../types.js";
 import { asArray, fetchJson, getNumber, getObject, getString, isObject, joinUrl } from "./http.js";
 
@@ -95,6 +96,7 @@ function toInsightAsset(insight: Record<string, unknown>): DataAsset {
     id: `posthog:insight:${id}`,
     platform: "posthog",
     type: "insight",
+    analysisType: readPostHogAnalysisType(query, filters),
     title: name,
     description: getString(insight.description),
     businessDomain: "product",

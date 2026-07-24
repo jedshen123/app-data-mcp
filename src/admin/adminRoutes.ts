@@ -1,7 +1,9 @@
 import type { Express, NextFunction, Request, Response } from "express";
 import {
+  bulkUpdateManagedAssetDomains,
   bulkUpdateManagedAssets,
   listAuditLogs,
+  listManagedAssetDomainSummaries,
   listManagedAssetDomains,
   listManagedAssetTypes,
   listManagedAssets,
@@ -10,10 +12,15 @@ import {
   type ManagedAssetSort
 } from "../metadataStore.js";
 import type { DataAssetType, DataPlatform } from "../types.js";
+import { parseCardSemanticMetadata } from "../cardSemantic.js";
+import { parseModelSemanticMetadata } from "../modelSemantic.js";
 import {
   buildEffectiveInstructions,
   getGlobalInstructions,
+  listToolUserPermissions,
   listManagedTools,
+  setToolUserPermission,
+  USER_GRANTABLE_TOOL_NAMES,
   updateGlobalInstructions,
   updateManagedTool
 } from "../toolStore.js";
@@ -66,7 +73,7 @@ export function registerAdminRoutes(app: Express): void {
       const result = await listManagedAssets({
         platform,
         assetType: readAssetType(req.query.type),
-        businessDomain: readString(req.query.businessDomain),
+        businessDomains: readStrings(req.query.businessDomain),
         query: readString(req.query.query),
         published,
         limit: readInteger(req.query.limit),
@@ -82,10 +89,30 @@ export function registerAdminRoutes(app: Express): void {
 
   app.get("/admin/api/domains", requireAdmin, async (req, res) => {
     try {
-      const domains = await listManagedAssetDomains(readPlatform(req.query.platform));
-      res.json({ domains });
+      const platform = readPlatform(req.query.platform);
+      const [domains, summaries] = await Promise.all([
+        listManagedAssetDomains(platform),
+        listManagedAssetDomainSummaries(platform)
+      ]);
+      res.json({ domains, summaries });
     } catch (error) {
       sendServerError(res, error);
+    }
+  });
+
+  app.patch("/admin/api/domains", requireAdminMutation, async (req, res) => {
+    try {
+      const platform = readPlatform(req.body?.platform);
+      if (!platform || platform === "local") throw new InputError("业务域平台无效。");
+      const domains = readStrings(req.body?.domains);
+      if (!domains.length) throw new InputError("请至少选择一个业务域。");
+      if (domains.length > 100) throw new InputError("单次最多操作 100 个业务域。");
+      if (typeof req.body?.published !== "boolean") throw new InputError("published 必须是布尔值。");
+      const updated = await bulkUpdateManagedAssetDomains(platform, domains, req.body.published);
+      res.json({ updated });
+    } catch (error) {
+      if (error instanceof InputError) res.status(400).json({ error: error.message });
+      else sendServerError(res, error);
     }
   });
 
@@ -168,6 +195,35 @@ export function registerAdminRoutes(app: Express): void {
     }
   });
 
+  app.get("/admin/api/tools/:toolName/permissions", requireAdmin, async (req, res) => {
+    try {
+      const toolName = readGrantableToolName(req.params.toolName);
+      const permissions = await listToolUserPermissions(toolName);
+      res.json({ toolName, permissions });
+    } catch (error) {
+      if (error instanceof InputError) res.status(400).json({ error: error.message });
+      else sendServerError(res, error);
+    }
+  });
+
+  app.put("/admin/api/tools/:toolName/permissions", requireAdminMutation, async (req, res) => {
+    try {
+      const toolName = readGrantableToolName(req.params.toolName);
+      const userEmail = readString(req.body?.userEmail);
+      if (!userEmail) throw new InputError("用户账号不能为空。");
+      if (typeof req.body?.granted !== "boolean") throw new InputError("granted 必须是布尔值。");
+      const admin = (await getAdminSession(req))!;
+      const permission = await setToolUserPermission(toolName, userEmail, req.body.granted, admin.user);
+      res.json({ toolName, userEmail: userEmail.trim().toLowerCase(), granted: req.body.granted, permission });
+    } catch (error) {
+      if (error instanceof InputError || (error instanceof Error && error.message.startsWith("用户账号"))) {
+        res.status(400).json({ error: error.message });
+      } else {
+        sendServerError(res, error);
+      }
+    }
+  });
+
   app.patch("/admin/api/tool-settings", requireAdminMutation, async (req, res) => {
     try {
       const globalInstructions = readString(req.body?.globalInstructions);
@@ -229,6 +285,28 @@ function readAssetPatch(value: unknown): ManagedAssetPatch {
     if (!Array.isArray(input.tags) || input.tags.some((item) => typeof item !== "string")) throw new InputError("标签格式无效。");
     patch.tags = Array.from(new Set(input.tags.map((item) => (item as string).trim()).filter(Boolean))).slice(0, 100);
   }
+  if (input.semantic !== undefined) {
+    if (input.semantic === null) {
+      patch.semantic = null;
+    } else {
+      try {
+        patch.semantic = parseCardSemanticMetadata(input.semantic);
+      } catch (error) {
+        throw new InputError(`Card 语义配置无效：${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  }
+  if (input.modelSemantic !== undefined) {
+    if (input.modelSemantic === null) {
+      patch.modelSemantic = null;
+    } else {
+      try {
+        patch.modelSemantic = parseModelSemanticMetadata(input.modelSemantic);
+      } catch (error) {
+        throw new InputError(`Model 语义配置无效：${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  }
   return patch;
 }
 
@@ -253,6 +331,19 @@ function readNullableString(value: unknown, label: string): string | null {
 
 function readString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function readStrings(value: unknown): string[] {
+  const values = Array.isArray(value) ? value : value === undefined ? [] : [value];
+  return Array.from(new Set(values.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean)));
+}
+
+function readGrantableToolName(value: unknown): string {
+  const toolName = readString(value);
+  if (!toolName || !USER_GRANTABLE_TOOL_NAMES.has(toolName)) {
+    throw new InputError("该工具不支持按用户授权。");
+  }
+  return toolName;
 }
 
 function readInteger(value: unknown): number | undefined {

@@ -43,6 +43,25 @@ export function summarizeAsset(asset: DataAsset) {
       downstreamAssets: asset.metric.downstreamAssets,
       queryDescription: asset.metric.queryDescription
     } : undefined,
+    semantic: asset.semantic ? {
+      role: asset.semantic.role,
+      baseGrain: asset.semantic.baseGrain,
+      execution: asset.semantic.execution,
+      defaultTimeDimension: asset.semantic.defaultTimeDimension,
+      dimensions: asset.semantic.dimensions,
+      measures: asset.semantic.measures.map((measure) => ({
+        name: measure.name,
+        sourceColumn: measure.sourceColumn,
+        label: measure.label,
+        description: measure.description,
+        unit: measure.unit,
+        synonyms: measure.synonyms,
+        timeDimension: measure.timeDimension,
+        rollup: measure.rollup,
+        cumulative: measure.cumulative
+      }))
+    } : undefined,
+    modelSemantic: asset.modelSemantic,
     audience: asset.audience,
     access: asset.access
       ? {
@@ -55,6 +74,48 @@ export function summarizeAsset(asset: DataAsset) {
       : undefined,
     warnings: asset.warnings
   };
+}
+
+export function summarizeSemanticMatches(asset: DataAsset, query: string) {
+  const tokens = normalizeSearchTokens(query);
+  if (!asset.semantic || !tokens.length) return undefined;
+  const matches = [
+    ...asset.semantic.dimensions.map((dimension) => ({
+      kind: "dimension" as const,
+      name: dimension.field,
+      label: dimension.label,
+      text: [dimension.field, dimension.label, dimension.description, ...(dimension.synonyms ?? [])].filter(Boolean).join(" ")
+    })),
+    ...asset.semantic.measures.map((measure) => ({
+      kind: "measure" as const,
+      name: measure.name,
+      label: measure.label,
+      text: [measure.name, measure.sourceColumn, measure.label, measure.description, ...(measure.synonyms ?? [])].filter(Boolean).join(" ")
+    }))
+  ].flatMap((item) => {
+    const normalized = item.text.toLocaleLowerCase();
+    const matchedTokens = tokens.filter((token) => normalized.includes(token));
+    return matchedTokens.length ? [{
+      kind: item.kind,
+      name: item.name,
+      label: item.label,
+      matchedTokens,
+      score: Number((matchedTokens.length / tokens.length).toFixed(3))
+    }] : [];
+  }).sort((left, right) => right.score - left.score);
+  return matches.length ? matches.slice(0, 10) : undefined;
+}
+
+function normalizeSearchTokens(query: string): string[] {
+  const normalized = query.toLocaleLowerCase().replace(/[^a-z0-9_\u3400-\u9fff]+/g, " ");
+  const tokens = new Set<string>();
+  for (const value of normalized.match(/[a-z0-9_]+/g) ?? []) if (value.length >= 2) tokens.add(value);
+  for (const sequence of normalized.match(/[\u3400-\u9fff]+/g) ?? []) {
+    for (const size of [2, 3]) {
+      for (let index = 0; index <= sequence.length - size; index += 1) tokens.add(sequence.slice(index, index + size));
+    }
+  }
+  return Array.from(tokens);
 }
 
 function summarizeDashboardParameterMappings(asset: DataAsset) {
